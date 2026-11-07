@@ -466,6 +466,9 @@ pub const Provider = struct {
 
     /// Returns true if provider supports streaming.
     pub fn supportsStreaming(self: Provider) bool {
+        // Streaming runs through a curl subprocess (sse.curlStream). Android apps have no curl,
+        // so use the std.http path there, which also keeps native tool calls enabled.
+        if (comptime @import("builtin").abi.isAndroid() and !@import("build_options").android_curl) return false;
         if (self.vtable.supports_streaming) |f| return f(self.ptr);
         return false;
     }

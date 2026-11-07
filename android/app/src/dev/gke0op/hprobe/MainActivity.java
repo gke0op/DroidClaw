@@ -33,7 +33,7 @@ public class MainActivity extends Activity {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         TextView title = new TextView(this);
-        title.setText("nullhermes probe v0.7.1");
+        title.setText("nullhermes probe v0.8");
         title.setTextSize(22);
         col.addView(title);
 
@@ -64,6 +64,8 @@ public class MainActivity extends Activity {
         peerField.setHint("peer address for step 8 (e.g. 2a02:...:44d2)");
         col.addView(peerField);
         add(col, "8 · Connect to peer (hello + round-trip time)", v -> connectPeer());
+        add(col, "9 · IDE-agent test (shell + file tools, on this phone)", v -> ideTest());
+        add(col, "10 · Can the app execute a file it wrote? (W^X check)", v -> wxCheck());
         add(col, "Export log to Downloads", v -> export());
         add(col, "Refresh", v -> refresh());
         add(col, "Stop heartbeat", v -> stop());
@@ -287,6 +289,62 @@ public class MainActivity extends Activity {
                         + " rtt_ms=" + (System.nanoTime() - tc) / 1_000_000 + " reply=" + reply);
             } catch (Exception e) {
                 Log.line(this, "PEER_FAIL to=" + host + " after_ms=" + (System.nanoTime() - t0) / 1_000_000 + " " + e);
+            }
+            runOnUiThread(this::refresh);
+        }).start();
+    }
+
+    private void ideTest() {
+        runAgent("IDE", "You are being tested on an Android phone. Do these steps with your tools, not from memory: "
+                + "1) shell: run `uname -a; id; echo SHELL_OK`. "
+                + "2) file tool: write hello.txt containing 'hi from DroidClaw'. "
+                + "3) file tool: read hello.txt back. "
+                + "4) shell: run `ls -la` in your workspace. "
+                + "Then report each tool's real output briefly.");
+    }
+
+    /** Shared runner: nullclaw agent -m PROMPT, key via env only, output tail logged. */
+    private void runAgent(String tag, String prompt) {
+        String key = keyField.getText().toString().trim();
+        if (key.isEmpty()) { toast("Paste the key first"); return; }
+        toast(tag + " running…");
+        new Thread(() -> {
+            String bin = getApplicationInfo().nativeLibraryDir + "/libnullclaw.so";
+            try {
+                ProcessBuilder pb = new ProcessBuilder(bin, "agent", "-m", prompt,
+                        "--provider", "openrouter", "--model", "stealth/crouton-alpha").redirectErrorStream(true);
+                pb.environment().put("HOME", getFilesDir().getAbsolutePath());
+                pb.environment().put("OPENROUTER_API_KEY", key);
+                long t0 = System.nanoTime();
+                Process pr = pb.start();
+                byte[] outb = pr.getInputStream().readAllBytes();
+                int code = pr.waitFor();
+                String o = new String(outb).replace('\n', ' ');
+                if (o.length() > 1500) o = o.substring(o.length() - 1500);
+                Log.line(this, tag + " exit=" + code + " ms=" + (System.nanoTime() - t0) / 1_000_000 + " out=" + o);
+                java.io.File hello = new java.io.File(getFilesDir(), ".nullclaw/workspace/hello.txt");
+                Log.line(this, tag + "_CHECK hello.txt exists=" + hello.exists()
+                        + (hello.exists() ? " content=" + new String(java.nio.file.Files.readAllBytes(hello.toPath())).trim() : ""));
+            } catch (Exception e) {
+                Log.line(this, tag + " EXEC_FAIL " + e);
+            }
+            runOnUiThread(this::refresh);
+        }).start();
+    }
+
+    /** Android 10+ (targetSdk >= 29) forbids executing files from app-writable storage. Measure it. */
+    private void wxCheck() {
+        new Thread(() -> {
+            try {
+                java.io.File src = new java.io.File(getApplicationInfo().nativeLibraryDir, "libnullclaw.so");
+                java.io.File dst = new java.io.File(getFilesDir(), "nc_copy");
+                java.nio.file.Files.copy(src.toPath(), dst.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                boolean x = dst.setExecutable(true);
+                Process pr = new ProcessBuilder(dst.getAbsolutePath(), "--version").redirectErrorStream(true).start();
+                String o = new String(pr.getInputStream().readAllBytes()).trim();
+                Log.line(this, "WX copy_exec_ok exit=" + pr.waitFor() + " chmod=" + x + " out=" + o + " targetSdk=" + getApplicationInfo().targetSdkVersion);
+            } catch (Exception e) {
+                Log.line(this, "WX copy_exec_BLOCKED " + e + " targetSdk=" + getApplicationInfo().targetSdkVersion);
             }
             runOnUiThread(this::refresh);
         }).start();

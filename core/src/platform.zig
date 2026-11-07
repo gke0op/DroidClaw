@@ -129,7 +129,9 @@ pub fn getTempDir(allocator: std.mem.Allocator) ![]const u8 {
 
 /// Returns the platform shell for executing commands.
 pub fn getShell() []const u8 {
-    return if (comptime builtin.os.tag == .windows) "cmd.exe" else "/bin/sh";
+    if (comptime builtin.os.tag == .windows) return "cmd.exe";
+    if (comptime builtin.abi.isAndroid()) return "/system/bin/sh"; // Android has no /bin/sh
+    return "/bin/sh";
 }
 
 /// Returns the shell flag for passing a command string.
