@@ -127,6 +127,12 @@ const dht_nodes = [_]struct { host: [:0]const u8, port: [:0]const u8 }{
     .{ .host = "dht.libtorrent.org", .port = "25401" },
 };
 
+/// KRPC node ids are exactly 20 bytes; a wrong length makes the whole ping malformed (v0.6/v0.7 bug).
+const node_id = "droidclaw-natprobe!!";
+comptime {
+    if (node_id.len != 20) @compileError("KRPC node id must be 20 bytes");
+}
+
 fn natProbe(w: *std.Io.Writer) void {
     const c = std.c;
     const fd = c.socket(c.AF.INET, c.SOCK.DGRAM, 0);
@@ -155,7 +161,7 @@ fn natProbe(w: *std.Io.Writer) void {
             continue;
         }
         defer c.freeaddrinfo(res.?);
-        const ping = "d1:ad2:id20:droidclaw-nat-probe!!e1:q4:ping1:t2:nh1:y1:qe";
+        const ping = "d1:ad2:id20:" ++ node_id ++ "e1:q4:ping1:t2:nh1:y1:qe";
         _ = c.sendto(fd, ping.ptr, ping.len, 0, res.?.addr, res.?.addrlen);
         var buf: [1500]u8 = undefined;
         const n = c.recvfrom(fd, &buf, buf.len, 0, null, null);

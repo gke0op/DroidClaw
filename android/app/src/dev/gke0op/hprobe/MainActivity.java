@@ -33,7 +33,7 @@ public class MainActivity extends Activity {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         TextView title = new TextView(this);
-        title.setText("nullhermes probe v0.7");
+        title.setText("nullhermes probe v0.7.1");
         title.setTextSize(22);
         col.addView(title);
 
