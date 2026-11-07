@@ -1,0 +1,1701 @@
+//! Service management — launchd (macOS), systemd/OpenRC/SysVinit (Linux), and SCM (Windows).
+//!
+//! Mirrors ZeroClaw's service module: install, start, stop, restart, status, uninstall.
+//! Uses child process execution to interact with launchctl / systemctl / init scripts / sc.exe.
+
+const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
+const platform = @import("platform.zig");
+const Config = @import("config.zig").Config;
+const daemon = @import("daemon.zig");
+const http_util = @import("http_util.zig");
+const fs_compat = @import("fs_compat.zig");
+const providers = @import("providers/root.zig");
+const security = @import("security/root.zig");
+
+const SERVICE_LABEL = "com.nullclaw.daemon";
+const WINDOWS_SERVICE_NAME = "nullclaw";
+const WINDOWS_SERVICE_DISPLAY_NAME = "nullclaw gateway runtime";
+const OPENRC_SERVICE_NAME = "nullclaw";
+const OPENRC_SERVICE_FILE = "/etc/init.d/nullclaw";
+const SERVICE_LAUNCHER_NAME = "service-launch.sh";
+const SERVICE_ENV_HELPER_NAME = "service-env";
+const SYSVINIT_SERVICE_FILE = OPENRC_SERVICE_FILE;
+const SYSVINIT_SERVICE_DIR = "/etc/init.d";
+const SYSVINIT_PID_FILE = "/var/run/nullclaw.pid";
+const SYSVINIT_LOG_FILE = "/var/log/nullclaw.log";
+pub const WINDOWS_SERVICE_GATEWAY_ARG = "__windows-service-gateway";
+
+const windows = std.os.windows;
+const WINDOWS_SERVICE_NAME_W = std.unicode.utf8ToUtf16LeStringLiteral(WINDOWS_SERVICE_NAME);
+
+const WindowsServiceStatusHandle = ?*opaque {};
+const WindowsServiceMainProc = *const fn (windows.DWORD, [*]?[*:0]u16) callconv(.winapi) void;
+const WindowsServiceControlProc = *const fn (windows.DWORD) callconv(.winapi) void;
+const WindowsServiceTableEntry = extern struct {
+    service_name: ?[*:0]const u16,
+    service_proc: ?WindowsServiceMainProc,
+};
+const WindowsServiceStatus = extern struct {
+    service_type: windows.DWORD,
+    current_state: windows.DWORD,
+    controls_accepted: windows.DWORD,
+    win32_exit_code: windows.DWORD,
+    service_specific_exit_code: windows.DWORD,
+    checkpoint: windows.DWORD,
+    wait_hint_ms: windows.DWORD,
+};
+
+const SERVICE_WIN32_OWN_PROCESS: windows.DWORD = 0x00000010;
+const SERVICE_STOPPED: windows.DWORD = 0x00000001;
+const SERVICE_START_PENDING: windows.DWORD = 0x00000002;
+const SERVICE_STOP_PENDING: windows.DWORD = 0x00000003;
+const SERVICE_RUNNING: windows.DWORD = 0x00000004;
+const SERVICE_ACCEPT_STOP: windows.DWORD = 0x00000001;
+const SERVICE_ACCEPT_SHUTDOWN: windows.DWORD = 0x00000004;
+const SERVICE_CONTROL_STOP: windows.DWORD = 0x00000001;
+const SERVICE_CONTROL_INTERROGATE: windows.DWORD = 0x00000004;
+const SERVICE_CONTROL_SHUTDOWN: windows.DWORD = 0x00000005;
+const SERVICE_NO_ERROR: windows.DWORD = 0;
+const SERVICE_GENERIC_FAILURE: windows.DWORD = 1;
+
+extern "advapi32" fn StartServiceCtrlDispatcherW(start_table: [*]const WindowsServiceTableEntry) callconv(.winapi) windows.BOOL;
+extern "advapi32" fn RegisterServiceCtrlHandlerW(service_name: [*:0]const u16, handler_proc: WindowsServiceControlProc) callconv(.winapi) WindowsServiceStatusHandle;
+extern "advapi32" fn SetServiceStatus(status_handle: WindowsServiceStatusHandle, status: *const WindowsServiceStatus) callconv(.winapi) windows.BOOL;
+
+var windows_service_status_handle: WindowsServiceStatusHandle = null;
+var windows_service_status = WindowsServiceStatus{
+    .service_type = SERVICE_WIN32_OWN_PROCESS,
+    .current_state = SERVICE_STOPPED,
+    .controls_accepted = 0,
+    .win32_exit_code = SERVICE_NO_ERROR,
+    .service_specific_exit_code = 0,
+    .checkpoint = 0,
+    .wait_hint_ms = 0,
+};
+var windows_service_checkpoint: windows.DWORD = 1;
+
+pub const ServiceCommand = enum {
+    install,
+    start,
+    stop,
+    restart,
+    status,
+    uninstall,
+};
+
+pub const ServiceError = error{
+    CommandFailed,
+    UnsupportedPlatform,
+    NoHomeDir,
+    FileCreateFailed,
+    OpenRcUnavailable,
+    SystemctlUnavailable,
+    SystemdUserUnavailable,
+};
+
+const LinuxServiceManager = enum {
+    systemd_user,
+    openrc,
+    sysvinit,
+};
+
+pub fn isWindowsServiceGatewayArg(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, WINDOWS_SERVICE_GATEWAY_ARG);
+}
+
+pub fn runWindowsServiceGateway(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+    if (comptime builtin.os.tag != .windows) return error.UnsupportedPlatform;
+
+    resetWindowsServiceState();
+
+    const table = [_]WindowsServiceTableEntry{
+        .{
+            .service_name = WINDOWS_SERVICE_NAME_W,
+            .service_proc = windowsServiceMain,
+        },
+        .{
+            .service_name = null,
+            .service_proc = null,
+        },
+    };
+
+    if (StartServiceCtrlDispatcherW(&table) == .FALSE) {
+        return error.CommandFailed;
+    }
+}
+
+/// Handle a service management command.
+pub fn handleCommand(
+    allocator: std.mem.Allocator,
+    command: ServiceCommand,
+) !void {
+    return switch (command) {
+        .install => install(allocator),
+        .start => startService(allocator),
+        .stop => stopService(allocator),
+        .restart => restartService(allocator),
+        .status => serviceStatus(allocator),
+        .uninstall => uninstall(allocator),
+    };
+}
+
+fn install(allocator: std.mem.Allocator) !void {
+    if (comptime builtin.os.tag == .macos) {
+        try installMacos(allocator);
+    } else if (comptime builtin.os.tag == .linux) {
+        try installLinux(allocator);
+    } else if (comptime builtin.os.tag == .windows) {
+        try installWindows(allocator);
+    } else {
+        return error.UnsupportedPlatform;
+    }
+}
+
+fn startService(allocator: std.mem.Allocator) !void {
+    if (comptime builtin.os.tag == .macos) {
+        const plist = try macosServiceFile(allocator);
+        defer allocator.free(plist);
+        try runChecked(allocator, &.{ "launchctl", "load", "-w", plist });
+        try runChecked(allocator, &.{ "launchctl", "start", SERVICE_LABEL });
+    } else if (comptime builtin.os.tag == .linux) {
+        switch (try detectLinuxServiceManager(allocator)) {
+            .systemd_user => {
+                try assertLinuxSystemdUserAvailable(allocator);
+                try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
+                try runChecked(allocator, &.{ "systemctl", "--user", "start", "nullclaw.service" });
+            },
+            .openrc => try openRcRunChecked(allocator, &.{ OPENRC_SERVICE_NAME, "start" }),
+            .sysvinit => try sysvinitRunChecked(allocator, "start"),
+        }
+    } else if (comptime builtin.os.tag == .windows) {
+        try runChecked(allocator, &.{ "sc.exe", "start", WINDOWS_SERVICE_NAME });
+    } else {
+        return error.UnsupportedPlatform;
+    }
+}
+
+fn stopService(allocator: std.mem.Allocator) !void {
+    if (comptime builtin.os.tag == .macos) {
+        const plist = try macosServiceFile(allocator);
+        defer allocator.free(plist);
+        runChecked(allocator, &.{ "launchctl", "stop", SERVICE_LABEL }) catch {};
+        runChecked(allocator, &.{ "launchctl", "unload", "-w", plist }) catch {};
+    } else if (comptime builtin.os.tag == .linux) {
+        switch (try detectLinuxServiceManager(allocator)) {
+            .systemd_user => {
+                try assertLinuxSystemdUserAvailable(allocator);
+                try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
+            },
+            .openrc => try openRcRunChecked(allocator, &.{ OPENRC_SERVICE_NAME, "stop" }),
+            .sysvinit => try sysvinitRunChecked(allocator, "stop"),
+        }
+    } else if (comptime builtin.os.tag == .windows) {
+        try runChecked(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
+    } else {
+        return error.UnsupportedPlatform;
+    }
+}
+
+fn restartService(allocator: std.mem.Allocator) !void {
+    // SysVinit: delegate to the init script's own restart (includes sleep).
+    if (comptime builtin.os.tag == .linux) {
+        if (detectLinuxServiceManager(allocator) catch null) |mgr| {
+            if (mgr == .sysvinit) {
+                try sysvinitRunChecked(allocator, "restart");
+                return;
+            }
+        }
+    }
+    // Restart should still proceed when stop reports "already stopped"/"not loaded",
+    // but should not mask unrelated stop failures.
+    try stopServiceForRestart(allocator);
+    try startService(allocator);
+}
+
+fn stopServiceForRestart(allocator: std.mem.Allocator) !void {
+    if (comptime builtin.os.tag == .macos) {
+        // launchctl stop/unload can fail when not loaded; treat as best-effort here.
+        const plist = try macosServiceFile(allocator);
+        defer allocator.free(plist);
+        runChecked(allocator, &.{ "launchctl", "stop", SERVICE_LABEL }) catch {};
+        runChecked(allocator, &.{ "launchctl", "unload", "-w", plist }) catch {};
+        return;
+    } else if (comptime builtin.os.tag == .linux) {
+        switch (try detectLinuxServiceManager(allocator)) {
+            .systemd_user => {
+                try assertLinuxSystemdUserAvailable(allocator);
+                const status = try runCaptureStatus(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
+                defer allocator.free(status.stdout);
+                defer allocator.free(status.stderr);
+                if (status.success) return;
+                const detail = captureStatusDetail(&status);
+                if (isSystemdUnitNotLoadedDetail(detail)) return;
+                return error.CommandFailed;
+            },
+            .openrc => {
+                const status = try openRcRunCaptureStatus(allocator, &.{ OPENRC_SERVICE_NAME, "stop" });
+                defer allocator.free(status.stdout);
+                defer allocator.free(status.stderr);
+                if (status.success) return;
+                const detail = captureStatusDetail(&status);
+                if (isOpenRcServiceMissingDetail(detail) or isOpenRcInactiveDetail(detail)) return;
+                return error.CommandFailed;
+            },
+            .sysvinit => unreachable, // restartService delegates to init script directly
+        }
+    } else if (comptime builtin.os.tag == .windows) {
+        const status = try runCaptureStatus(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
+        defer allocator.free(status.stdout);
+        defer allocator.free(status.stderr);
+        if (status.success) return;
+        const detail = captureStatusDetail(&status);
+        if (isWindowsServiceMissingDetail(detail) or isWindowsServiceNotRunningDetail(detail)) return;
+        return error.CommandFailed;
+    } else {
+        return error.UnsupportedPlatform;
+    }
+}
+
+fn serviceStatus(allocator: std.mem.Allocator) !void {
+    var stdout_buf: [4096]u8 = undefined;
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
+    const w = &bw.interface;
+
+    if (comptime builtin.os.tag == .macos) {
+        const output = runCapture(allocator, &.{ "launchctl", "list" }) catch "";
+        defer if (output.len > 0) allocator.free(output);
+        const running = std.mem.indexOf(u8, output, SERVICE_LABEL) != null;
+        try w.print("Service: {s}\n", .{if (running) "running/loaded" else "not loaded"});
+        const plist = try macosServiceFile(allocator);
+        defer allocator.free(plist);
+        try w.print("Unit: {s}\n", .{plist});
+        try w.flush();
+    } else if (comptime builtin.os.tag == .linux) {
+        switch (try detectLinuxServiceManager(allocator)) {
+            .systemd_user => {
+                try assertLinuxSystemdUserAvailable(allocator);
+                const output = runCapture(allocator, &.{ "systemctl", "--user", "is-active", "nullclaw.service" }) catch try allocator.dupe(u8, "unknown");
+                defer allocator.free(output);
+                try w.print("Service state: {s}\n", .{std.mem.trim(u8, output, " \t\n\r")});
+                const unit = try linuxServiceFile(allocator);
+                defer allocator.free(unit);
+                try w.print("Unit: {s}\n", .{unit});
+                try w.flush();
+            },
+            .openrc => {
+                if (!fileExistsAbsolute(OPENRC_SERVICE_FILE)) {
+                    try w.print("Service: not installed\n", .{});
+                    try w.print("Script: {s}\n", .{OPENRC_SERVICE_FILE});
+                    try w.flush();
+                    return;
+                }
+                const status = try openRcRunCaptureStatus(allocator, &.{ OPENRC_SERVICE_NAME, "status" });
+                defer allocator.free(status.stdout);
+                defer allocator.free(status.stderr);
+                const detail = captureStatusDetail(&status);
+                try w.print("Service state: {s}\n", .{openRcServiceState(detail)});
+                try w.print("Script: {s}\n", .{OPENRC_SERVICE_FILE});
+                try w.flush();
+            },
+            .sysvinit => {
+                if (!fileExistsAbsolute(SYSVINIT_SERVICE_FILE)) {
+                    try w.print("Service: not installed\n", .{});
+                    try w.print("Script: {s}\n", .{SYSVINIT_SERVICE_FILE});
+                    try w.flush();
+                    return;
+                }
+                const status = try sysvinitRunCaptureStatus(allocator, "status");
+                defer allocator.free(status.stdout);
+                defer allocator.free(status.stderr);
+                const detail = captureStatusDetail(&status);
+                if (!status.success and !isSysvinitInactiveDetail(detail)) return error.CommandFailed;
+                try w.print("Service state: {s}\n", .{sysvinitServiceState(detail)});
+                try w.print("Script: {s}\n", .{SYSVINIT_SERVICE_FILE});
+                try w.flush();
+            },
+        }
+    } else if (comptime builtin.os.tag == .windows) {
+        const status = try runCaptureStatus(allocator, &.{ "sc.exe", "query", WINDOWS_SERVICE_NAME });
+        defer allocator.free(status.stdout);
+        defer allocator.free(status.stderr);
+
+        const detail = captureStatusDetail(&status);
+        if (!status.success and isWindowsServiceMissingDetail(detail)) {
+            try w.print("Service: not installed\n", .{});
+            try w.print("Name: {s}\n", .{WINDOWS_SERVICE_NAME});
+            try w.flush();
+            return;
+        }
+        if (!status.success) return error.CommandFailed;
+
+        try w.print("Service state: {s}\n", .{windowsServiceState(status.stdout)});
+        try w.print("Name: {s}\n", .{WINDOWS_SERVICE_NAME});
+        try w.flush();
+    } else {
+        return error.UnsupportedPlatform;
+    }
+}
+
+fn uninstall(allocator: std.mem.Allocator) !void {
+    if (comptime builtin.os.tag == .macos) {
+        try stopService(allocator);
+        const plist = try macosServiceFile(allocator);
+        defer allocator.free(plist);
+        std_compat.fs.deleteFileAbsolute(plist) catch {};
+    } else if (comptime builtin.os.tag == .linux) {
+        switch (try detectLinuxServiceManager(allocator)) {
+            .systemd_user => {
+                try stopService(allocator);
+                const unit = try linuxServiceFile(allocator);
+                defer allocator.free(unit);
+                std_compat.fs.deleteFileAbsolute(unit) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+                try assertLinuxSystemdUserAvailable(allocator);
+                try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
+            },
+            .openrc => try uninstallOpenRc(allocator),
+            .sysvinit => try uninstallSysvinit(allocator),
+        }
+    } else if (comptime builtin.os.tag == .windows) {
+        try uninstallWindows(allocator);
+    } else {
+        return error.UnsupportedPlatform;
+    }
+}
+
+fn installMacos(allocator: std.mem.Allocator) !void {
+    const plist = try macosServiceFile(allocator);
+    defer allocator.free(plist);
+
+    // Ensure parent directory exists
+    if (std.mem.lastIndexOfScalar(u8, plist, '/')) |idx| {
+        std_compat.fs.makeDirAbsolute(plist[0..idx]) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+
+    // Get current executable path
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
+
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
+    const config_dir = try std_compat.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    defer allocator.free(config_dir);
+    const launcher_path = try writeServiceLauncher(allocator, service_exe_path, config_dir);
+    defer allocator.free(launcher_path);
+    const logs_dir = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/logs", .{home});
+    defer allocator.free(logs_dir);
+    std_compat.fs.makeDirAbsolute(logs_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const stdout_log = try std.fmt.allocPrint(allocator, "{s}/daemon.stdout.log", .{logs_dir});
+    defer allocator.free(stdout_log);
+    const stderr_log = try std.fmt.allocPrint(allocator, "{s}/daemon.stderr.log", .{logs_dir});
+    defer allocator.free(stderr_log);
+
+    const content = try std.fmt.allocPrint(allocator,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\  <key>Label</key>
+        \\  <string>{s}</string>
+        \\  <key>ProgramArguments</key>
+        \\  <array>
+        \\    <string>{s}</string>
+        \\  </array>
+        \\  <key>RunAtLoad</key>
+        \\  <true/>
+        \\  <key>KeepAlive</key>
+        \\  <true/>
+        \\  <key>StandardOutPath</key>
+        \\  <string>{s}</string>
+        \\  <key>StandardErrorPath</key>
+        \\  <string>{s}</string>
+        \\</dict>
+        \\</plist>
+    , .{ SERVICE_LABEL, xmlEscape(launcher_path), xmlEscape(stdout_log), xmlEscape(stderr_log) });
+    defer allocator.free(content);
+
+    const file = try std_compat.fs.createFileAbsolute(plist, .{});
+    defer file.close();
+    try file.writeAll(content);
+}
+
+fn resolveServiceExecutablePath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
+    if (try preferredHomebrewShimPath(allocator, exe_path)) |candidate| {
+        std_compat.fs.accessAbsolute(candidate, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                allocator.free(candidate);
+                return allocator.dupe(u8, exe_path);
+            },
+            else => {
+                allocator.free(candidate);
+                return err;
+            },
+        };
+        return candidate;
+    }
+    return allocator.dupe(u8, exe_path);
+}
+
+fn preferredHomebrewShimPath(allocator: std.mem.Allocator, exe_path: []const u8) !?[]u8 {
+    if (!std.mem.endsWith(u8, exe_path, "/bin/nullclaw")) {
+        return null;
+    }
+
+    const cellar_marker = "/Cellar/nullclaw/";
+    const cellar_index = std.mem.indexOf(u8, exe_path, cellar_marker) orelse return null;
+    if (cellar_index == 0) {
+        return null;
+    }
+
+    // selfExePath uses POSIX separators for Homebrew installs even when tests run on Windows.
+    const candidate = try std.fmt.allocPrint(allocator, "{s}/bin/nullclaw", .{exe_path[0..cellar_index]});
+    return candidate;
+}
+
+fn installLinux(allocator: std.mem.Allocator) !void {
+    switch (try detectLinuxServiceManager(allocator)) {
+        .systemd_user => try installLinuxSystemd(allocator),
+        .openrc => try installLinuxOpenRc(allocator),
+        .sysvinit => try installLinuxSysvinit(allocator),
+    }
+}
+
+fn installLinuxSystemd(allocator: std.mem.Allocator) !void {
+    const unit = try linuxServiceFile(allocator);
+    defer allocator.free(unit);
+
+    try assertLinuxSystemdUserAvailable(allocator);
+
+    if (std.mem.lastIndexOfScalar(u8, unit, '/')) |idx| {
+        try fs_compat.makePath(unit[0..idx]);
+    }
+
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
+
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
+    const config_dir = try std_compat.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    defer allocator.free(config_dir);
+    const launcher_path = try writeServiceLauncher(allocator, service_exe_path, config_dir);
+    defer allocator.free(launcher_path);
+
+    const content = try std.fmt.allocPrint(allocator,
+        \\[Unit]
+        \\Description=nullclaw gateway runtime
+        \\After=network.target
+        \\
+        \\[Service]
+        \\Type=simple
+        \\ExecStart={s}
+        \\Restart=always
+        \\RestartSec=3
+        \\EnvironmentFile=-{s}/.env
+        \\
+        \\[Install]
+        \\WantedBy=default.target
+    , .{ launcher_path, config_dir });
+    defer allocator.free(content);
+
+    const file = try std_compat.fs.createFileAbsolute(unit, .{});
+    defer file.close();
+    try file.writeAll(content);
+
+    try runChecked(allocator, &.{ "systemctl", "--user", "daemon-reload" });
+    try runChecked(allocator, &.{ "systemctl", "--user", "enable", "nullclaw.service" });
+}
+
+fn installLinuxOpenRc(allocator: std.mem.Allocator) !void {
+    const openrc_run_path = getOpenRcRunPath() orelse return error.OpenRcUnavailable;
+
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
+
+    const service_user = getServiceUser(allocator);
+    defer if (service_user) |user| allocator.free(user);
+
+    const service_home = try getServiceHomeDir(allocator);
+    defer allocator.free(service_home);
+
+    const config_dir = try std_compat.fs.path.join(allocator, &.{ service_home, ".nullclaw" });
+    defer allocator.free(config_dir);
+    const launcher_path = try writeServiceLauncher(allocator, service_exe_path, config_dir);
+    defer allocator.free(launcher_path);
+
+    const script = try buildOpenRcScript(allocator, .{
+        .openrc_run_path = openrc_run_path,
+        .service_command_path = launcher_path,
+        .service_user = service_user,
+        .service_home = service_home,
+        .config_dir = config_dir,
+    });
+    defer allocator.free(script);
+
+    const file = try std_compat.fs.createFileAbsolute(OPENRC_SERVICE_FILE, .{});
+    defer file.close();
+    try file.writeAll(script);
+    try file.chmod(0o755);
+
+    try openRcUpdateChecked(allocator, &.{ "add", OPENRC_SERVICE_NAME, "default" });
+}
+
+fn installLinuxSysvinit(allocator: std.mem.Allocator) !void {
+    const start_stop_daemon_path = getSysvinitStartStopDaemonPath() orelse return error.CommandFailed;
+
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
+
+    const service_user = getServiceUser(allocator);
+    defer if (service_user) |user| allocator.free(user);
+
+    const service_home = try getServiceHomeDir(allocator);
+    defer allocator.free(service_home);
+
+    const config_dir = try std_compat.fs.path.join(allocator, &.{ service_home, ".nullclaw" });
+    defer allocator.free(config_dir);
+    const launcher_path = try writeServiceLauncher(allocator, service_exe_path, config_dir);
+    defer allocator.free(launcher_path);
+
+    const script = try buildSysvinitScript(allocator, .{
+        .start_stop_daemon_path = start_stop_daemon_path,
+        .service_command_path = launcher_path,
+        .service_user = service_user,
+        .service_home = service_home,
+        .config_dir = config_dir,
+    });
+    defer allocator.free(script);
+
+    const file = try std_compat.fs.createFileAbsolute(SYSVINIT_SERVICE_FILE, .{});
+    defer file.close();
+    try file.writeAll(script);
+    try file.chmod(0o755);
+
+    sysvinitUpdateChecked(allocator, &.{ "nullclaw", "defaults", "95" }) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn uninstallSysvinit(allocator: std.mem.Allocator) !void {
+    sysvinitRunChecked(allocator, "stop") catch {};
+    sysvinitUpdateChecked(allocator, &.{ "-f", "nullclaw", "remove" }) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    std_compat.fs.deleteFileAbsolute(SYSVINIT_SERVICE_FILE) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn installWindows(allocator: std.mem.Allocator) !void {
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
+    const bin_path = try windowsServiceBinPath(allocator, exe_path);
+    defer allocator.free(bin_path);
+
+    const create = try runCaptureStatus(allocator, &.{
+        "sc.exe",
+        "create",
+        WINDOWS_SERVICE_NAME,
+        "binPath=",
+        bin_path,
+        "start=",
+        "auto",
+        "DisplayName=",
+        WINDOWS_SERVICE_DISPLAY_NAME,
+    });
+    defer allocator.free(create.stdout);
+    defer allocator.free(create.stderr);
+
+    if (!create.success) {
+        const detail = captureStatusDetail(&create);
+        if (!isWindowsServiceAlreadyExistsDetail(detail)) return error.CommandFailed;
+        try runChecked(allocator, &.{
+            "sc.exe",
+            "config",
+            WINDOWS_SERVICE_NAME,
+            "binPath=",
+            bin_path,
+            "start=",
+            "auto",
+            "DisplayName=",
+            WINDOWS_SERVICE_DISPLAY_NAME,
+        });
+    }
+
+    // Best-effort metadata polish.
+    runChecked(allocator, &.{ "sc.exe", "description", WINDOWS_SERVICE_NAME, WINDOWS_SERVICE_DISPLAY_NAME }) catch {};
+}
+
+fn uninstallWindows(allocator: std.mem.Allocator) !void {
+    // Stop is best-effort.
+    const stop = try runCaptureStatus(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
+    defer allocator.free(stop.stdout);
+    defer allocator.free(stop.stderr);
+    if (!stop.success and !isWindowsServiceMissingDetail(captureStatusDetail(&stop))) {
+        // Ignore stop races/non-running state.
+    }
+
+    const del = try runCaptureStatus(allocator, &.{ "sc.exe", "delete", WINDOWS_SERVICE_NAME });
+    defer allocator.free(del.stdout);
+    defer allocator.free(del.stderr);
+
+    if (!del.success and !isWindowsServiceMissingDetail(captureStatusDetail(&del))) {
+        return error.CommandFailed;
+    }
+}
+
+// ── Path helpers ─────────────────────────────────────────────────
+
+fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {
+    return platform.getHomeDir(allocator) catch return error.NoHomeDir;
+}
+
+fn macosServiceFile(allocator: std.mem.Allocator) ![]const u8 {
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
+    return std_compat.fs.path.join(allocator, &.{ home, "Library", "LaunchAgents", SERVICE_LABEL ++ ".plist" });
+}
+
+fn linuxServiceFile(allocator: std.mem.Allocator) ![]const u8 {
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
+    return std_compat.fs.path.join(allocator, &.{ home, ".config", "systemd", "user", "nullclaw.service" });
+}
+
+fn fileExistsAbsolute(path: []const u8) bool {
+    std_compat.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return false,
+    };
+    return true;
+}
+
+fn getServiceUser(allocator: std.mem.Allocator) ?[]const u8 {
+    if (platform.getEnvOrNull(allocator, "SUDO_USER")) |sudo_user| return sudo_user;
+    return platform.getEnvOrNull(allocator, "USER");
+}
+
+fn parsePasswdHome(passwd_contents: []const u8, username: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, passwd_contents, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+
+        var fields = std.mem.splitScalar(u8, line, ':');
+        const name = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        _ = fields.next() orelse continue;
+        const home = fields.next() orelse continue;
+
+        if (std.mem.eql(u8, name, username)) return home;
+    }
+    return null;
+}
+
+fn getHomeDirForUserFromPasswd(allocator: std.mem.Allocator, username: []const u8) ![]const u8 {
+    const passwd = try std_compat.fs.cwd().readFileAlloc(allocator, "/etc/passwd", 1024 * 1024);
+    defer allocator.free(passwd);
+
+    const home = parsePasswdHome(passwd, username) orelse return error.NoHomeDir;
+    return allocator.dupe(u8, home);
+}
+
+fn getServiceHomeDir(allocator: std.mem.Allocator) ![]const u8 {
+    if (platform.getEnvOrNull(allocator, "SUDO_USER")) |sudo_user| {
+        defer allocator.free(sudo_user);
+        return getHomeDirForUserFromPasswd(allocator, sudo_user);
+    }
+    return getHomeDir(allocator);
+}
+
+// ── Process helpers ──────────────────────────────────────────────
+
+const CaptureStatus = struct {
+    stdout: []u8,
+    stderr: []u8,
+    success: bool,
+};
+
+const OpenRcScriptConfig = struct {
+    openrc_run_path: []const u8,
+    service_command_path: []const u8,
+    service_user: ?[]const u8,
+    service_home: []const u8,
+    config_dir: []const u8,
+};
+
+const SysvinitScriptConfig = struct {
+    start_stop_daemon_path: []const u8,
+    service_command_path: []const u8,
+    service_user: ?[]const u8,
+    service_home: []const u8,
+    config_dir: []const u8,
+};
+
+fn captureStatusDetail(status: *const CaptureStatus) []const u8 {
+    const stderr_trimmed = std.mem.trim(u8, status.stderr, " \t\r\n");
+    if (stderr_trimmed.len > 0) return stderr_trimmed;
+    return std.mem.trim(u8, status.stdout, " \t\r\n");
+}
+
+fn isSystemdUnavailableDetail(detail: []const u8) bool {
+    return std.ascii.findIgnoreCase(detail, "systemctl --user unavailable") != null or
+        std.ascii.findIgnoreCase(detail, "systemctl not available") != null or
+        std.ascii.findIgnoreCase(detail, "failed to connect to bus") != null or
+        std.ascii.findIgnoreCase(detail, "not been booted with systemd") != null or
+        std.ascii.findIgnoreCase(detail, "system has not been booted with systemd") != null or
+        std.ascii.findIgnoreCase(detail, "systemd user services are required") != null or
+        std.ascii.findIgnoreCase(detail, "no such file or directory") != null;
+}
+
+const openrc_markers = [_][]const u8{
+    "/run/openrc",
+    "/run/openrc/softlevel",
+};
+
+const openrc_command_candidates = [_][]const u8{
+    "/sbin/rc-service",
+    "/usr/sbin/rc-service",
+    "/bin/rc-service",
+    "/usr/bin/rc-service",
+};
+
+const openrc_update_candidates = [_][]const u8{
+    "/sbin/rc-update",
+    "/usr/sbin/rc-update",
+    "/bin/rc-update",
+    "/usr/bin/rc-update",
+};
+
+const openrc_run_candidates = [_][]const u8{
+    "/sbin/openrc-run",
+    "/usr/sbin/openrc-run",
+    "/bin/openrc-run",
+    "/usr/bin/openrc-run",
+};
+
+const sysvinit_start_stop_daemon_candidates = [_][]const u8{
+    "/sbin/start-stop-daemon",
+    "/usr/sbin/start-stop-daemon",
+    "/bin/start-stop-daemon",
+    "/usr/bin/start-stop-daemon",
+};
+
+const sysvinit_update_candidates = [_][]const u8{
+    "/sbin/update-rc.d",
+    "/usr/sbin/update-rc.d",
+    "/bin/update-rc.d",
+    "/usr/bin/update-rc.d",
+};
+
+fn hasAnyMatchingPath(candidate_paths: []const []const u8, existing_paths: []const []const u8) bool {
+    for (candidate_paths) |candidate| {
+        for (existing_paths) |path| {
+            if (std.mem.eql(u8, candidate, path)) return true;
+        }
+    }
+    return false;
+}
+
+fn hasOpenRcMarkerInPaths(existing_paths: []const []const u8) bool {
+    return hasAnyMatchingPath(&openrc_markers, existing_paths);
+}
+
+fn hasOpenRcCommandInPaths(existing_paths: []const []const u8) bool {
+    return hasAnyMatchingPath(&openrc_command_candidates, existing_paths) and
+        hasAnyMatchingPath(&openrc_run_candidates, existing_paths);
+}
+
+fn hasSysvinitCommandInPaths(existing_paths: []const []const u8) bool {
+    return hasAnyMatchingPath(&sysvinit_start_stop_daemon_candidates, existing_paths);
+}
+
+fn firstExistingAbsolutePath(paths: []const []const u8) ?[]const u8 {
+    for (paths) |path| {
+        if (fileExistsAbsolute(path)) return path;
+    }
+    return null;
+}
+
+fn hasAnyExistingAbsolutePath(paths: []const []const u8) bool {
+    return firstExistingAbsolutePath(paths) != null;
+}
+
+fn getOpenRcServiceCommandPath() ?[]const u8 {
+    return firstExistingAbsolutePath(&openrc_command_candidates);
+}
+
+fn getOpenRcUpdatePath() ?[]const u8 {
+    return firstExistingAbsolutePath(&openrc_update_candidates);
+}
+
+fn getOpenRcRunPath() ?[]const u8 {
+    return firstExistingAbsolutePath(&openrc_run_candidates);
+}
+
+fn getSysvinitStartStopDaemonPath() ?[]const u8 {
+    return firstExistingAbsolutePath(&sysvinit_start_stop_daemon_candidates);
+}
+
+fn getSysvinitUpdatePath() ?[]const u8 {
+    return firstExistingAbsolutePath(&sysvinit_update_candidates);
+}
+
+fn linuxHasOpenRcRuntime() bool {
+    return hasAnyExistingAbsolutePath(&openrc_markers);
+}
+
+fn linuxHasOpenRcSupport() bool {
+    return getOpenRcServiceCommandPath() != null and
+        getOpenRcUpdatePath() != null and
+        getOpenRcRunPath() != null;
+}
+
+fn detectLinuxServiceManager(allocator: std.mem.Allocator) !LinuxServiceManager {
+    if (linuxHasOpenRcRuntime()) {
+        if (!linuxHasOpenRcSupport()) return error.OpenRcUnavailable;
+        return .openrc;
+    }
+
+    assertLinuxSystemdUserAvailable(allocator) catch |err| switch (err) {
+        error.SystemctlUnavailable, error.SystemdUserUnavailable => {
+            if (linuxHasOpenRcSupport()) return .openrc;
+            if (linuxHasSysvinitSupport()) return .sysvinit;
+            return err;
+        },
+        else => return err,
+    };
+
+    return .systemd_user;
+}
+
+/// SysVinit fallback: check for /etc/init.d/ and start-stop-daemon.
+fn linuxHasSysvinitSupport() bool {
+    return fileExistsAbsolute(SYSVINIT_SERVICE_DIR) and getSysvinitStartStopDaemonPath() != null;
+}
+
+fn shellDoubleQuoted(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.append(allocator, '"');
+    for (input) |ch| {
+        switch (ch) {
+            '\\', '"', '$', '`' => {
+                try out.append(allocator, '\\');
+                try out.append(allocator, ch);
+            },
+            else => try out.append(allocator, ch),
+        }
+    }
+    try out.append(allocator, '"');
+    return out.toOwnedSlice(allocator);
+}
+
+fn joinPosixPath(allocator: std.mem.Allocator, dir_path: []const u8, leaf: []const u8) ![]u8 {
+    if (dir_path.len == 0) return allocator.dupe(u8, leaf);
+    if (std.mem.endsWith(u8, dir_path, "/")) {
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ dir_path, leaf });
+    }
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, leaf });
+}
+
+fn serviceLauncherPath(allocator: std.mem.Allocator, config_dir: []const u8) ![]const u8 {
+    return joinPosixPath(allocator, config_dir, SERVICE_LAUNCHER_NAME);
+}
+
+fn serviceEnvHelperPath(allocator: std.mem.Allocator, config_dir: []const u8) ![]const u8 {
+    return joinPosixPath(allocator, config_dir, SERVICE_ENV_HELPER_NAME);
+}
+
+fn buildServiceLauncherScript(allocator: std.mem.Allocator, service_exe_path: []const u8, config_dir: []const u8) ![]u8 {
+    const config_quoted = try shellDoubleQuoted(allocator, config_dir);
+    defer allocator.free(config_quoted);
+    const helper_path = try serviceEnvHelperPath(allocator, config_dir);
+    defer allocator.free(helper_path);
+    const helper_quoted = try shellDoubleQuoted(allocator, helper_path);
+    defer allocator.free(helper_quoted);
+    const exe_quoted = try shellDoubleQuoted(allocator, service_exe_path);
+    defer allocator.free(exe_quoted);
+
+    return std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\set -eu
+        \\export NULLCLAW_HOME={s}
+        \\if [ -x {s} ]; then
+        \\    exec {s} {s} gateway
+        \\fi
+        \\exec {s} gateway
+        \\
+    , .{ config_quoted, helper_quoted, helper_quoted, exe_quoted, exe_quoted });
+}
+
+fn writeServiceLauncher(allocator: std.mem.Allocator, service_exe_path: []const u8, config_dir: []const u8) ![]const u8 {
+    try fs_compat.makePath(config_dir);
+
+    const launcher_path = try serviceLauncherPath(allocator, config_dir);
+    errdefer allocator.free(launcher_path);
+
+    const script = try buildServiceLauncherScript(allocator, service_exe_path, config_dir);
+    defer allocator.free(script);
+
+    const file = try std_compat.fs.createFileAbsolute(launcher_path, .{});
+    defer file.close();
+    try file.writeAll(script);
+    try file.chmod(0o755);
+
+    return launcher_path;
+}
+
+fn buildOpenRcScript(allocator: std.mem.Allocator, cfg: OpenRcScriptConfig) ![]u8 {
+    const command_quoted = try shellDoubleQuoted(allocator, cfg.service_command_path);
+    defer allocator.free(command_quoted);
+    const home_quoted = try shellDoubleQuoted(allocator, cfg.service_home);
+    defer allocator.free(home_quoted);
+    const config_quoted = try shellDoubleQuoted(allocator, cfg.config_dir);
+    defer allocator.free(config_quoted);
+    const user_line = if (cfg.service_user) |service_user| blk: {
+        const user_quoted = try shellDoubleQuoted(allocator, service_user);
+        defer allocator.free(user_quoted);
+        break :blk try std.fmt.allocPrint(allocator, "command_user={s}\nexport USER={s}\n", .{ user_quoted, user_quoted });
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(user_line);
+
+    return std.fmt.allocPrint(allocator,
+        \\#!{s}
+        \\
+        \\name="nullclaw"
+        \\description="nullclaw gateway runtime"
+        \\command={s}
+        \\command_background="yes"
+        \\pidfile="/run/${{RC_SVCNAME}}.pid"
+        \\directory={s}
+        \\export HOME={s}
+        \\export NULLCLAW_HOME={s}
+        \\{s}
+        \\respawn
+        \\respawn_delay=3
+        \\
+        \\depend() {{
+        \\    need net
+        \\}}
+    , .{ cfg.openrc_run_path, command_quoted, home_quoted, home_quoted, config_quoted, user_line });
+}
+
+fn buildSysvinitScript(allocator: std.mem.Allocator, cfg: SysvinitScriptConfig) ![]u8 {
+    const start_stop_daemon_quoted = try shellDoubleQuoted(allocator, cfg.start_stop_daemon_path);
+    defer allocator.free(start_stop_daemon_quoted);
+    const daemon_quoted = try shellDoubleQuoted(allocator, cfg.service_command_path);
+    defer allocator.free(daemon_quoted);
+    const home_quoted = try shellDoubleQuoted(allocator, cfg.service_home);
+    defer allocator.free(home_quoted);
+    const config_quoted = try shellDoubleQuoted(allocator, cfg.config_dir);
+    defer allocator.free(config_quoted);
+    const pidfile_quoted = try shellDoubleQuoted(allocator, SYSVINIT_PID_FILE);
+    defer allocator.free(pidfile_quoted);
+    const logfile_quoted = try shellDoubleQuoted(allocator, SYSVINIT_LOG_FILE);
+    defer allocator.free(logfile_quoted);
+
+    const user_line = if (cfg.service_user) |service_user| blk: {
+        const user_quoted = try shellDoubleQuoted(allocator, service_user);
+        defer allocator.free(user_quoted);
+        break :blk try std.fmt.allocPrint(allocator, "    export USER={s}\n", .{user_quoted});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(user_line);
+
+    const chuid_args = if (cfg.service_user) |service_user| blk: {
+        const user_quoted = try shellDoubleQuoted(allocator, service_user);
+        defer allocator.free(user_quoted);
+        break :blk try std.fmt.allocPrint(allocator, " --chuid {s}", .{user_quoted});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(chuid_args);
+
+    return std.fmt.allocPrint(allocator,
+        \\#!/bin/sh
+        \\### BEGIN INIT INFO
+        \\# Provides:          nullclaw
+        \\# Required-Start:    $network $remote_fs $syslog
+        \\# Required-Stop:     $network $remote_fs
+        \\# Should-Start:      ntp ntpsec
+        \\# Default-Start:     2 3 4 5
+        \\# Default-Stop:      0 1 6
+        \\# Description:       nullclaw gateway runtime
+        \\### END INIT INFO
+        \\
+        \\set -e
+        \\
+        \\DAEMON={s}
+        \\SERVICE_HOME={s}
+        \\NULLCLAW_HOME={s}
+        \\PIDFILE={s}
+        \\LOGFILE={s}
+        \\RESPAWN_DELAY=3
+        \\
+        \\case "$1" in
+        \\  start)
+        \\    echo "Starting nullclaw..."
+        \\    export HOME="$SERVICE_HOME"
+        \\    export NULLCLAW_HOME="$NULLCLAW_HOME"
+        \\{s}
+        \\    {s} --start --background --make-pidfile --pidfile "$PIDFILE"{s} --chdir "$SERVICE_HOME" --startas /bin/sh -- -c "trap 'if [ -n \"\${{child:-}}\" ]; then kill \"\$child\" 2>/dev/null; fi; exit 0' TERM INT; while true; do \"$DAEMON\" gateway >> \"$LOGFILE\" 2>&1 & child=\$!; wait \"\$child\"; status=\$?; child=; if [ \"\$status\" -eq 0 ]; then exit 0; fi; sleep $RESPAWN_DELAY; done"
+        \\    ;;
+        \\  stop)
+        \\    echo "Stopping nullclaw..."
+        \\    if {s} --stop --pidfile "$PIDFILE" --retry 5; then
+        \\      rm -f "$PIDFILE"
+        \\    else
+        \\      status=$?
+        \\      if [ "$status" -eq 1 ]; then
+        \\        echo "nullclaw is not running"
+        \\        exit 0
+        \\      fi
+        \\      exit "$status"
+        \\    fi
+        \\    ;;
+        \\  restart)
+        \\    "$0" stop
+        \\    sleep 1
+        \\    "$0" start
+        \\    ;;
+        \\  status)
+        \\    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        \\      echo "nullclaw is running (PID $(cat "$PIDFILE"))"
+        \\      exit 0
+        \\    fi
+        \\    echo "nullclaw is not running"
+        \\    exit 3
+        \\    ;;
+        \\  *)
+        \\    echo "Usage: $0 {{start|stop|restart|status}}"
+        \\    exit 1
+        \\    ;;
+        \\esac
+        \\
+        \\exit 0
+    , .{
+        daemon_quoted,
+        home_quoted,
+        config_quoted,
+        pidfile_quoted,
+        logfile_quoted,
+        user_line,
+        start_stop_daemon_quoted,
+        chuid_args,
+        start_stop_daemon_quoted,
+    });
+}
+
+fn isSystemdUnitNotLoadedDetail(detail: []const u8) bool {
+    return std.ascii.findIgnoreCase(detail, "unit nullclaw.service not loaded") != null or
+        std.ascii.findIgnoreCase(detail, "could not be found") != null or
+        std.ascii.findIgnoreCase(detail, "not loaded") != null;
+}
+
+fn isOpenRcServiceMissingDetail(detail: []const u8) bool {
+    return std.ascii.findIgnoreCase(detail, "does not exist") != null or
+        std.ascii.findIgnoreCase(detail, "not found") != null or
+        std.ascii.findIgnoreCase(detail, "service `nullclaw'") != null;
+}
+
+fn isOpenRcInactiveDetail(detail: []const u8) bool {
+    return std.ascii.findIgnoreCase(detail, "stopped") != null or
+        std.ascii.findIgnoreCase(detail, "not started") != null or
+        std.ascii.findIgnoreCase(detail, "inactive") != null;
+}
+
+fn openRcServiceState(detail: []const u8) []const u8 {
+    if (std.ascii.findIgnoreCase(detail, "started") != null or
+        std.ascii.findIgnoreCase(detail, "running") != null)
+    {
+        return "running";
+    }
+    if (std.ascii.findIgnoreCase(detail, "crashed") != null) return "crashed";
+    if (isOpenRcInactiveDetail(detail)) return "stopped";
+    if (isOpenRcServiceMissingDetail(detail)) return "not installed";
+    return "unknown";
+}
+
+fn isSysvinitInactiveDetail(detail: []const u8) bool {
+    return std.ascii.findIgnoreCase(detail, "not running") != null or
+        std.ascii.findIgnoreCase(detail, "no process in pidfile") != null or
+        std.ascii.findIgnoreCase(detail, "not started") != null;
+}
+
+fn sysvinitServiceState(detail: []const u8) []const u8 {
+    if (std.ascii.findIgnoreCase(detail, "is running") != null or
+        std.ascii.findIgnoreCase(detail, "running (pid") != null)
+    {
+        return "running";
+    }
+    if (isSysvinitInactiveDetail(detail)) return "stopped";
+    return "unknown";
+}
+
+fn isWindowsServiceMissingDetail(detail: []const u8) bool {
+    return std.ascii.findIgnoreCase(detail, "1060") != null or
+        std.ascii.findIgnoreCase(detail, "does not exist as an installed service") != null or
+        std.ascii.findIgnoreCase(detail, "service does not exist") != null;
+}
+
+fn isWindowsServiceNotRunningDetail(detail: []const u8) bool {
+    return std.ascii.findIgnoreCase(detail, "1062") != null or
+        std.ascii.findIgnoreCase(detail, "service has not been started") != null;
+}
+
+fn isWindowsServiceAlreadyExistsDetail(detail: []const u8) bool {
+    return std.ascii.findIgnoreCase(detail, "1073") != null or
+        std.ascii.findIgnoreCase(detail, "already exists") != null;
+}
+
+fn windowsServiceState(query_output: []const u8) []const u8 {
+    if (std.ascii.findIgnoreCase(query_output, "RUNNING") != null) return "running";
+    if (std.ascii.findIgnoreCase(query_output, "STOPPED") != null) return "stopped";
+    if (std.ascii.findIgnoreCase(query_output, "START_PENDING") != null) return "start_pending";
+    if (std.ascii.findIgnoreCase(query_output, "STOP_PENDING") != null) return "stop_pending";
+    if (std.ascii.findIgnoreCase(query_output, "PAUSED") != null) return "paused";
+    return "unknown";
+}
+
+fn runCaptureStatus(allocator: std.mem.Allocator, argv: []const []const u8) !CaptureStatus {
+    var child = std_compat.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.spawn() catch |err| switch (err) {
+        error.FileNotFound => {
+            if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;
+            return err;
+        },
+        else => return err,
+    };
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CommandFailed;
+    };
+    errdefer allocator.free(stdout);
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        allocator.free(stdout);
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CommandFailed;
+    };
+    errdefer allocator.free(stderr);
+
+    const result = try child.wait();
+    const success = switch (result) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    return .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .success = success,
+    };
+}
+
+fn assertLinuxSystemdUserAvailable(allocator: std.mem.Allocator) !void {
+    const status = try runCaptureStatus(allocator, &.{ "systemctl", "--user", "status" });
+    defer allocator.free(status.stdout);
+    defer allocator.free(status.stderr);
+
+    if (status.success) return;
+
+    const stderr_trimmed = std.mem.trim(u8, status.stderr, " \t\r\n");
+    const stdout_trimmed = std.mem.trim(u8, status.stdout, " \t\r\n");
+    const detail = if (stderr_trimmed.len > 0) stderr_trimmed else stdout_trimmed;
+
+    if (isSystemdUnavailableDetail(detail)) return error.SystemdUserUnavailable;
+    return error.CommandFailed;
+}
+
+fn openRcRunChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    const rc_service = getOpenRcServiceCommandPath() orelse return error.OpenRcUnavailable;
+    var full: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer full.deinit(allocator);
+    try full.append(allocator, rc_service);
+    try full.appendSlice(allocator, argv);
+    try runChecked(allocator, full.items);
+}
+
+fn openRcRunCaptureStatus(allocator: std.mem.Allocator, argv: []const []const u8) !CaptureStatus {
+    const rc_service = getOpenRcServiceCommandPath() orelse return error.OpenRcUnavailable;
+    var full: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer full.deinit(allocator);
+    try full.append(allocator, rc_service);
+    try full.appendSlice(allocator, argv);
+    return runCaptureStatus(allocator, full.items);
+}
+
+fn openRcUpdateChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    const rc_update = getOpenRcUpdatePath() orelse return error.OpenRcUnavailable;
+    var full: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer full.deinit(allocator);
+    try full.append(allocator, rc_update);
+    try full.appendSlice(allocator, argv);
+    try runChecked(allocator, full.items);
+}
+
+fn sysvinitRunChecked(allocator: std.mem.Allocator, action: []const u8) !void {
+    runChecked(allocator, &.{ SYSVINIT_SERVICE_FILE, action }) catch |err| switch (err) {
+        error.FileNotFound => return error.CommandFailed,
+        else => return err,
+    };
+}
+
+fn sysvinitRunCaptureStatus(allocator: std.mem.Allocator, action: []const u8) !CaptureStatus {
+    return runCaptureStatus(allocator, &.{ SYSVINIT_SERVICE_FILE, action }) catch |err| switch (err) {
+        error.FileNotFound => return error.CommandFailed,
+        else => return err,
+    };
+}
+
+fn sysvinitUpdateChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    const update_rc = getSysvinitUpdatePath() orelse return error.FileNotFound;
+    var full: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer full.deinit(allocator);
+    try full.append(allocator, update_rc);
+    try full.appendSlice(allocator, argv);
+    try runChecked(allocator, full.items);
+}
+
+fn uninstallOpenRc(allocator: std.mem.Allocator) !void {
+    const stop_status = openRcRunCaptureStatus(allocator, &.{ OPENRC_SERVICE_NAME, "stop" }) catch |err| switch (err) {
+        error.CommandFailed => return error.CommandFailed,
+        else => return err,
+    };
+    defer allocator.free(stop_status.stdout);
+    defer allocator.free(stop_status.stderr);
+
+    const stop_detail = captureStatusDetail(&stop_status);
+    if (!stop_status.success and !isOpenRcServiceMissingDetail(stop_detail) and !isOpenRcInactiveDetail(stop_detail)) {
+        return error.CommandFailed;
+    }
+
+    openRcUpdateChecked(allocator, &.{ "del", OPENRC_SERVICE_NAME, "default" }) catch |err| switch (err) {
+        error.CommandFailed => {},
+        else => return err,
+    };
+
+    std_compat.fs.deleteFileAbsolute(OPENRC_SERVICE_FILE) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    var child = std_compat.process.Child.init(argv, allocator);
+    // Avoid deadlocks: we do not consume pipes in runChecked.
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    child.spawn() catch |err| switch (err) {
+        error.FileNotFound => {
+            if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;
+            return err;
+        },
+        else => return err,
+    };
+    const result = try child.wait();
+    switch (result) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}
+
+fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    var child = std_compat.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    // We only need stdout here; inheriting/ignoring stderr prevents pipe backpressure hangs.
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch |err| switch (err) {
+        error.FileNotFound => {
+            if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;
+            return err;
+        },
+        else => return err,
+    };
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CommandFailed;
+    };
+    errdefer allocator.free(stdout);
+    _ = child.wait() catch {
+        return error.CommandFailed;
+    };
+    return stdout;
+}
+
+fn windowsServiceBinPath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "\"{s}\" {s}", .{ exe_path, WINDOWS_SERVICE_GATEWAY_ARG });
+}
+
+fn resetWindowsServiceState() void {
+    windows_service_status_handle = null;
+    windows_service_checkpoint = 1;
+    windows_service_status = .{
+        .service_type = SERVICE_WIN32_OWN_PROCESS,
+        .current_state = SERVICE_STOPPED,
+        .controls_accepted = 0,
+        .win32_exit_code = SERVICE_NO_ERROR,
+        .service_specific_exit_code = 0,
+        .checkpoint = 0,
+        .wait_hint_ms = 0,
+    };
+}
+
+fn updateWindowsServiceStatus(current_state: windows.DWORD, win32_exit_code: windows.DWORD, wait_hint_ms: windows.DWORD) void {
+    const handle = windows_service_status_handle orelse return;
+
+    windows_service_status.current_state = current_state;
+    windows_service_status.win32_exit_code = win32_exit_code;
+    windows_service_status.service_specific_exit_code = 0;
+    windows_service_status.wait_hint_ms = wait_hint_ms;
+    windows_service_status.controls_accepted = switch (current_state) {
+        SERVICE_RUNNING => SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+        else => 0,
+    };
+    windows_service_status.checkpoint = switch (current_state) {
+        SERVICE_START_PENDING, SERVICE_STOP_PENDING => blk: {
+            const checkpoint = windows_service_checkpoint;
+            windows_service_checkpoint += 1;
+            break :blk checkpoint;
+        },
+        else => 0,
+    };
+
+    _ = SetServiceStatus(handle, &windows_service_status);
+}
+
+fn applyServiceRuntimeProviderOverrides(config: *const Config) !void {
+    try http_util.setProxyOverride(config.http_request.proxy);
+    try providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars);
+}
+
+fn runWindowsServiceGatewayProcess(allocator: std.mem.Allocator) !void {
+    var cfg = try Config.load(allocator);
+    defer cfg.deinit();
+
+    try cfg.validate();
+    try applyServiceRuntimeProviderOverrides(&cfg);
+    if (!security.isYoloGatewayAllowed(cfg.autonomy.level, cfg.gateway.host, security.isYoloForceEnabled(allocator))) {
+        std.debug.print(
+            "Refusing to start gateway service with autonomy.level=yolo on non-local host '{s}'. Use localhost or set NULLCLAW_ALLOW_YOLO=1 to force this insecure mode.\n",
+            .{cfg.gateway.host},
+        );
+        return error.InsecureYoloGatewayBind;
+    }
+
+    updateWindowsServiceStatus(SERVICE_RUNNING, SERVICE_NO_ERROR, 0);
+    try daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
+}
+
+fn windowsServiceMain(_: windows.DWORD, _: [*]?[*:0]u16) callconv(.winapi) void {
+    windows_service_status_handle = RegisterServiceCtrlHandlerW(WINDOWS_SERVICE_NAME_W, windowsServiceControlHandler);
+    if (windows_service_status_handle == null) return;
+
+    updateWindowsServiceStatus(SERVICE_START_PENDING, SERVICE_NO_ERROR, 10_000);
+
+    runWindowsServiceGatewayProcess(std.heap.smp_allocator) catch {
+        updateWindowsServiceStatus(SERVICE_STOPPED, SERVICE_GENERIC_FAILURE, 0);
+        return;
+    };
+
+    updateWindowsServiceStatus(SERVICE_STOPPED, SERVICE_NO_ERROR, 0);
+}
+
+fn windowsServiceControlHandler(control: windows.DWORD) callconv(.winapi) void {
+    switch (control) {
+        SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN => {
+            daemon.requestShutdown();
+            // The control handler should transition to STOP_PENDING and return;
+            // ServiceMain reports STOPPED once the daemon has actually exited.
+            updateWindowsServiceStatus(SERVICE_STOP_PENDING, SERVICE_NO_ERROR, 30_000);
+        },
+        SERVICE_CONTROL_INTERROGATE => {
+            const handle = windows_service_status_handle orelse return;
+            _ = SetServiceStatus(handle, &windows_service_status);
+        },
+        else => {},
+    }
+}
+
+// ── XML escape ───────────────────────────────────────────────────
+
+fn xmlEscape(input: []const u8) []const u8 {
+    // For plist generation, the paths should be safe (no special XML chars).
+    // If needed, we'd allocate. For now, return as-is since paths rarely contain XML specials.
+    return input;
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+test "service label is set" {
+    try std.testing.expect(SERVICE_LABEL.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, SERVICE_LABEL, "nullclaw") != null);
+}
+
+test "macosServiceFile contains label" {
+    const path = macosServiceFile(std.testing.allocator) catch return;
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(std.mem.indexOf(u8, path, SERVICE_LABEL) != null);
+    try std.testing.expect(std.mem.endsWith(u8, path, ".plist"));
+}
+
+test "linuxServiceFile contains service suffix" {
+    const path = linuxServiceFile(std.testing.allocator) catch return;
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "nullclaw.service"));
+}
+
+test "xmlEscape returns input for safe strings" {
+    const input = "/usr/local/bin/nullclaw";
+    try std.testing.expectEqualStrings(input, xmlEscape(input));
+}
+
+test "preferredHomebrewShimPath resolves Apple Silicon Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/opt/homebrew/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath resolves Intel Homebrew Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/usr/local/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/usr/local/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath resolves Linux Homebrew Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/home/linuxbrew/.linuxbrew/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/home/linuxbrew/.linuxbrew/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath ignores non-Cellar paths" {
+    try std.testing.expect((try preferredHomebrewShimPath(std.testing.allocator, "/Applications/nullclaw/bin/nullclaw")) == null);
+}
+
+test "preferredHomebrewShimPath ignores non-executable Cellar paths" {
+    try std.testing.expect((try preferredHomebrewShimPath(std.testing.allocator, "/opt/homebrew/Cellar/nullclaw/2026.3.7/share/nullclaw.txt")) == null);
+}
+
+test "runChecked succeeds for true command" {
+    runChecked(std.testing.allocator, &.{"true"}) catch {
+        // May fail in CI — just ensure it compiles
+        return;
+    };
+}
+
+test "runCapture captures stdout" {
+    const output = runCapture(std.testing.allocator, &.{ "echo", "hello" }) catch {
+        return;
+    };
+    defer std.testing.allocator.free(output);
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, output, " \t\n\r"), "hello"));
+}
+
+test "isSystemdUnavailableDetail detects common unavailable errors" {
+    try std.testing.expect(isSystemdUnavailableDetail("systemctl --user unavailable: failed to connect to bus"));
+    try std.testing.expect(isSystemdUnavailableDetail("systemctl not available; systemd user services are required on Linux"));
+    try std.testing.expect(isSystemdUnavailableDetail("Failed to connect to bus: No medium found"));
+    try std.testing.expect(isSystemdUnavailableDetail("System has not been booted with systemd as init system"));
+    try std.testing.expect(isSystemdUnavailableDetail("No such file or directory"));
+    try std.testing.expect(!isSystemdUnavailableDetail("unit nullclaw.service not found"));
+    try std.testing.expect(!isSystemdUnavailableDetail("permission denied"));
+}
+
+test "hasOpenRcMarkerInPaths detects common OpenRC markers" {
+    try std.testing.expect(hasOpenRcMarkerInPaths(&.{"/run/openrc/softlevel"}));
+    try std.testing.expect(hasOpenRcMarkerInPaths(&.{"/run/openrc"}));
+    try std.testing.expect(!hasOpenRcMarkerInPaths(&.{"/run/systemd/system"}));
+}
+
+test "hasOpenRcCommandInPaths detects required OpenRC commands" {
+    try std.testing.expect(hasOpenRcCommandInPaths(&.{ "/sbin/rc-service", "/sbin/openrc-run" }));
+    try std.testing.expect(!hasOpenRcCommandInPaths(&.{"/sbin/rc-service"}));
+}
+
+test "hasSysvinitCommandInPaths detects start-stop-daemon" {
+    try std.testing.expect(hasSysvinitCommandInPaths(&.{"/usr/sbin/start-stop-daemon"}));
+    try std.testing.expect(!hasSysvinitCommandInPaths(&.{"/usr/sbin/update-rc.d"}));
+}
+
+test "hasAnyExistingAbsolutePath checks actual filesystem state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("openrc");
+    const existing = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "openrc");
+    defer std.testing.allocator.free(existing);
+
+    const missing = try std_compat.fs.path.join(std.testing.allocator, &.{ existing, "softlevel" });
+    defer std.testing.allocator.free(missing);
+
+    try std.testing.expect(hasAnyExistingAbsolutePath(&.{ missing, existing }));
+    try std.testing.expect(!hasAnyExistingAbsolutePath(&.{missing}));
+}
+
+test "parsePasswdHome extracts matching user home" {
+    const passwd =
+        \\root:x:0:0:root:/root:/bin/sh
+        \\alice:x:1000:1000:Alice:/home/alice:/bin/ash
+    ;
+    try std.testing.expectEqualStrings("/home/alice", parsePasswdHome(passwd, "alice").?);
+    try std.testing.expect(parsePasswdHome(passwd, "bob") == null);
+}
+
+test "buildServiceLauncherScript prefers optional service-env helper" {
+    const script = try buildServiceLauncherScript(std.testing.allocator, "/usr/local/bin/nullclaw", "/home/alice/.nullclaw");
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "export NULLCLAW_HOME=\"/home/alice/.nullclaw\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "exec \"/home/alice/.nullclaw/service-env\" \"/usr/local/bin/nullclaw\" gateway") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "exec \"/usr/local/bin/nullclaw\" gateway") != null);
+}
+
+test "service launcher helper paths use POSIX separators" {
+    const launcher_path = try serviceLauncherPath(std.testing.allocator, "/home/alice/.nullclaw");
+    defer std.testing.allocator.free(launcher_path);
+    try std.testing.expectEqualStrings("/home/alice/.nullclaw/service-launch.sh", launcher_path);
+
+    const helper_path = try serviceEnvHelperPath(std.testing.allocator, "/home/alice/.nullclaw");
+    defer std.testing.allocator.free(helper_path);
+    // Regression: service launcher scripts are POSIX shell, so helper paths must
+    // stay slash-delimited even when tests execute on Windows hosts.
+    try std.testing.expectEqualStrings("/home/alice/.nullclaw/service-env", helper_path);
+}
+
+test "buildOpenRcScript includes user and config env" {
+    const script = try buildOpenRcScript(std.testing.allocator, .{
+        .openrc_run_path = "/sbin/openrc-run",
+        .service_command_path = "/home/alice/.nullclaw/service-launch.sh",
+        .service_user = "alice",
+        .service_home = "/home/alice",
+        .config_dir = "/home/alice/.nullclaw",
+    });
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "#!/sbin/openrc-run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "command=\"/home/alice/.nullclaw/service-launch.sh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "command_user=\"alice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "export HOME=\"/home/alice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "export NULLCLAW_HOME=\"/home/alice/.nullclaw\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "respawn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "respawn_delay=3") != null);
+    // Regression: OpenRC env injection belongs in service-launch.sh/service-env,
+    // not a root-run start_pre hook.
+    try std.testing.expect(std.mem.indexOf(u8, script, "start_pre()") == null);
+    try std.testing.expect(std.mem.indexOf(u8, script, ".env") == null);
+}
+
+test "buildSysvinitScript includes user and config env" {
+    const script = try buildSysvinitScript(std.testing.allocator, .{
+        .start_stop_daemon_path = "/usr/sbin/start-stop-daemon",
+        .service_command_path = "/home/alice/.nullclaw/service-launch.sh",
+        .service_user = "alice",
+        .service_home = "/home/alice",
+        .config_dir = "/home/alice/.nullclaw",
+    });
+    defer std.testing.allocator.free(script);
+
+    try std.testing.expect(std.mem.indexOf(u8, script, "DAEMON=\"/home/alice/.nullclaw/service-launch.sh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "NULLCLAW_HOME=\"/home/alice/.nullclaw\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "export USER=\"alice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "\"/usr/sbin/start-stop-daemon\" --start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--chuid \"alice\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--startas /bin/sh -- -c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "$DAEMON") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "$LOGFILE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "# Required-Start:    $network $remote_fs $syslog") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "# Should-Start:      ntp ntpsec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "RESPAWN_DELAY=3") != null);
+    // Regression: RTC-less SysVinit hosts should recover by respawning failed
+    // gateway processes without blocking boot on a provider-specific HTTPS probe.
+    try std.testing.expect(std.mem.indexOf(u8, script, "trap 'if [ -n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "while true; do") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "child=\\$!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "wait \\\"\\$child\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "sleep $RESPAWN_DELAY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "ENVFILE=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "openrouter.ai") == null);
+}
+
+test "openRcServiceState classifies common states" {
+    try std.testing.expectEqualStrings("running", openRcServiceState("status: started"));
+    try std.testing.expectEqualStrings("stopped", openRcServiceState("status: stopped"));
+    try std.testing.expectEqualStrings("crashed", openRcServiceState("status: crashed"));
+    try std.testing.expectEqualStrings("not installed", openRcServiceState("service `nullclaw' does not exist"));
+}
+
+test "sysvinitServiceState classifies common states" {
+    try std.testing.expectEqualStrings("running", sysvinitServiceState("nullclaw is running (PID 42)"));
+    try std.testing.expectEqualStrings("stopped", sysvinitServiceState("nullclaw is not running"));
+    try std.testing.expectEqualStrings("unknown", sysvinitServiceState("unexpected output"));
+}
+
+test "isSystemdUnitNotLoadedDetail detects stop-not-loaded patterns" {
+    try std.testing.expect(isSystemdUnitNotLoadedDetail("Unit nullclaw.service not loaded."));
+    try std.testing.expect(isSystemdUnitNotLoadedDetail("Unit nullclaw.service could not be found."));
+    try std.testing.expect(isSystemdUnitNotLoadedDetail("not loaded"));
+    try std.testing.expect(!isSystemdUnitNotLoadedDetail("permission denied"));
+}
+
+test "isWindowsServiceMissingDetail detects missing-service patterns" {
+    try std.testing.expect(isWindowsServiceMissingDetail("OpenService FAILED 1060"));
+    try std.testing.expect(isWindowsServiceMissingDetail("The specified service does not exist as an installed service."));
+    try std.testing.expect(!isWindowsServiceMissingDetail("OpenService FAILED 5: Access is denied."));
+}
+
+test "isWindowsServiceNotRunningDetail detects stop-not-running patterns" {
+    try std.testing.expect(isWindowsServiceNotRunningDetail("ControlService FAILED 1062"));
+    try std.testing.expect(isWindowsServiceNotRunningDetail("The service has not been started."));
+    try std.testing.expect(!isWindowsServiceNotRunningDetail("OpenService FAILED 1060"));
+}
+
+test "isWindowsServiceAlreadyExistsDetail detects duplicate-service patterns" {
+    try std.testing.expect(isWindowsServiceAlreadyExistsDetail("CreateService FAILED 1073"));
+    try std.testing.expect(isWindowsServiceAlreadyExistsDetail("service already exists"));
+    try std.testing.expect(!isWindowsServiceAlreadyExistsDetail("CreateService FAILED 5"));
+}
+
+test "windowsServiceState parses common states" {
+    try std.testing.expectEqualStrings("running", windowsServiceState("STATE              : 4  RUNNING"));
+    try std.testing.expectEqualStrings("stopped", windowsServiceState("STATE              : 1  STOPPED"));
+    try std.testing.expectEqualStrings("start_pending", windowsServiceState("STATE              : 2  START_PENDING"));
+    try std.testing.expectEqualStrings("unknown", windowsServiceState("STATE              : ?"));
+}
+
+test "windowsServiceBinPath uses hidden service gateway entrypoint" {
+    const bin_path = try windowsServiceBinPath(std.testing.allocator, "C:\\Program Files\\nullclaw\\nullclaw.exe");
+    defer std.testing.allocator.free(bin_path);
+
+    try std.testing.expectEqualStrings("\"C:\\Program Files\\nullclaw\\nullclaw.exe\" __windows-service-gateway", bin_path);
+}
+
+test "isWindowsServiceGatewayArg matches hidden service sentinel" {
+    try std.testing.expect(isWindowsServiceGatewayArg("__windows-service-gateway"));
+    try std.testing.expect(!isWindowsServiceGatewayArg("gateway"));
+}

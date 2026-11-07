@@ -1,0 +1,2593 @@
+const builtin = @import("builtin");
+const std = @import("std");
+const std_compat = @import("compat");
+const Atomic = @import("portable_atomic.zig").Atomic;
+const config_types = @import("config_types.zig");
+const fs_compat = @import("fs_compat.zig");
+
+/// Events the observer can record.
+pub const ObserverEvent = union(enum) {
+    agent_start: struct { provider: []const u8, model: []const u8, channel: ?[]const u8 = null, bot_account: ?[]const u8 = null },
+    llm_request: struct { provider: []const u8, model: []const u8, messages_count: usize, detail: ?[]const u8 = null },
+    llm_response: struct {
+        provider: []const u8,
+        model: []const u8,
+        duration_ms: u64,
+        success: bool,
+        error_message: ?[]const u8,
+        prompt_tokens: ?u32 = null,
+        completion_tokens: ?u32 = null,
+        total_tokens: ?u32 = null,
+        detail: ?[]const u8 = null,
+    },
+    agent_end: struct { duration_ms: u64, tokens_used: ?u64 },
+    tool_call_start: struct { tool: []const u8 },
+    tool_call: struct {
+        tool: []const u8,
+        duration_ms: u64,
+        success: bool,
+        args: ?[]const u8 = null,
+        detail: ?[]const u8 = null,
+    },
+    tool_iterations_exhausted: struct { iterations: u32 },
+    turn_complete: void,
+    channel_message: struct { channel: []const u8, direction: []const u8 },
+    heartbeat_tick: void,
+    err: struct { component: []const u8, message: []const u8 },
+    subagent_start: struct { agent_name: []const u8, task: []const u8 },
+    cron_job_start: struct { task: []const u8, channel: ?[]const u8 = null, bot_account: ?[]const u8 = null },
+    skill_load: struct { name: []const u8, duration_ms: u64 },
+};
+
+/// Numeric metrics.
+pub const ObserverMetric = union(enum) {
+    request_latency_ms: u64,
+    tokens_used: u64,
+    active_sessions: u64,
+    queue_depth: u64,
+};
+
+/// Core observability interface — Zig vtable pattern.
+pub const Observer = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        record_event: *const fn (ptr: *anyopaque, event: *const ObserverEvent) void,
+        record_metric: *const fn (ptr: *anyopaque, metric: *const ObserverMetric) void,
+        flush: *const fn (ptr: *anyopaque) void,
+        name: *const fn (ptr: *anyopaque) []const u8,
+        get_trace_id: *const fn (ptr: *anyopaque) ?[32]u8,
+        set_trace_id: *const fn (ptr: *anyopaque, trace_id: [32]u8) void,
+    };
+
+    pub fn recordEvent(self: Observer, event: *const ObserverEvent) void {
+        self.vtable.record_event(self.ptr, event);
+    }
+
+    pub fn recordMetric(self: Observer, metric: *const ObserverMetric) void {
+        self.vtable.record_metric(self.ptr, metric);
+    }
+
+    pub fn flush(self: Observer) void {
+        self.vtable.flush(self.ptr);
+    }
+
+    pub fn getName(self: Observer) []const u8 {
+        return self.vtable.name(self.ptr);
+    }
+
+    pub fn getTraceId(self: Observer) ?[32]u8 {
+        return self.vtable.get_trace_id(self.ptr);
+    }
+
+    pub fn setTraceId(self: Observer, trace_id: [32]u8) void {
+        self.vtable.set_trace_id(self.ptr, trace_id);
+    }
+};
+
+const MAX_TOOL_CALL_DETAIL_LEN: usize = 1024;
+const MAX_LLM_DETAIL_LEN: usize = 2048;
+const MAX_EVENT_DETAIL_LEN: usize = 1024;
+threadlocal var lightweight_trace_id: ?[32]u8 = null;
+
+fn fillRandomHex(buf: []u8) void {
+    var raw: [16]u8 = undefined;
+    const needed = buf.len / 2;
+    std_compat.crypto.random.bytes(raw[0..needed]);
+    const hex = "0123456789abcdef";
+    for (0..needed) |i| {
+        buf[i * 2] = hex[raw[i] >> 4];
+        buf[i * 2 + 1] = hex[raw[i] & 0x0f];
+    }
+}
+
+fn truncateForObserver(detail: ?[]const u8, max_len: usize) ?[]const u8 {
+    const raw = detail orelse return null;
+    if (raw.len == 0) return null;
+    if (raw.len <= max_len) return raw;
+    return raw[0..max_len];
+}
+
+fn toolDetailForObserver(detail: ?[]const u8) ?[]const u8 {
+    return truncateForObserver(detail, MAX_TOOL_CALL_DETAIL_LEN);
+}
+
+fn llmDetailForObserver(detail: ?[]const u8) ?[]const u8 {
+    return truncateForObserver(detail, MAX_LLM_DETAIL_LEN);
+}
+
+fn eventDetailForObserver(detail: ?[]const u8) ?[]const u8 {
+    return truncateForObserver(detail, MAX_EVENT_DETAIL_LEN);
+}
+
+fn currentLightweightTraceId() ?[32]u8 {
+    return lightweight_trace_id;
+}
+
+fn ensureLightweightTraceId() [32]u8 {
+    if (lightweight_trace_id) |trace_id| return trace_id;
+    var trace_id: [32]u8 = undefined;
+    fillRandomHex(&trace_id);
+    lightweight_trace_id = trace_id;
+    return trace_id;
+}
+
+fn setLightweightTraceId(trace_id: ?[32]u8) void {
+    lightweight_trace_id = trace_id;
+}
+
+fn traceIdForEvent(event: *const ObserverEvent) ?[32]u8 {
+    return switch (event.*) {
+        .turn_complete => currentLightweightTraceId(),
+        else => ensureLightweightTraceId(),
+    };
+}
+
+fn clearTraceIdForEvent(event: *const ObserverEvent) void {
+    switch (event.*) {
+        .turn_complete, .agent_end => setLightweightTraceId(null),
+        else => {},
+    }
+}
+
+fn formatTracePrefix(buf: []u8, trace_id: ?[32]u8) []const u8 {
+    const id = trace_id orelse return "";
+    return std.fmt.bufPrint(buf, "trace_id={s} ", .{id[0..]}) catch "";
+}
+
+fn appendTraceIdToJsonObject(out: []u8, json_object: []const u8, trace_id: ?[32]u8) []const u8 {
+    const id = trace_id orelse return json_object;
+    if (json_object.len == 0 or json_object[json_object.len - 1] != '}') return json_object;
+    return std.fmt.bufPrint(out, "{s},\"trace_id\":{f}}}", .{
+        json_object[0 .. json_object.len - 1],
+        std.json.fmt(id[0..], .{}),
+    }) catch json_object;
+}
+
+// ── NoopObserver ─────────────────────────────────────────────────────
+
+/// Zero-overhead observer — all methods are no-ops.
+pub const NoopObserver = struct {
+    const vtable = Observer.VTable{
+        .record_event = noopRecordEvent,
+        .record_metric = noopRecordMetric,
+        .flush = noopFlush,
+        .name = noopName,
+        .get_trace_id = noopGetTraceId,
+        .set_trace_id = noopSetTraceId,
+    };
+
+    pub fn observer(self: *NoopObserver) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    fn noopRecordEvent(_: *anyopaque, _: *const ObserverEvent) void {}
+    fn noopRecordMetric(_: *anyopaque, _: *const ObserverMetric) void {}
+    fn noopFlush(_: *anyopaque) void {}
+    fn noopName(_: *anyopaque) []const u8 {
+        return "noop";
+    }
+    fn noopGetTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn noopSetTraceId(_: *anyopaque, _: [32]u8) void {}
+};
+
+// ── LogObserver ──────────────────────────────────────────────────────
+
+/// Log-based observer — uses std.log for all output.
+pub const LogObserver = struct {
+    const vtable = Observer.VTable{
+        .record_event = logRecordEvent,
+        .record_metric = logRecordMetric,
+        .flush = logFlush,
+        .name = logName,
+        .get_trace_id = logGetTraceId,
+        .set_trace_id = logSetTraceId,
+    };
+
+    pub fn observer(self: *LogObserver) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    fn logRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
+        const trace_id = traceIdForEvent(event);
+        var trace_buf: [48]u8 = undefined;
+        const prefix = formatTracePrefix(&trace_buf, trace_id);
+        switch (event.*) {
+            .agent_start => |e| {
+                if (e.channel) |ch| {
+                    if (e.bot_account) |bot| {
+                        std.log.info("{s}agent.start provider={s} model={s} channel={s} bot_account={s}", .{ prefix, e.provider, e.model, ch, bot });
+                    } else {
+                        std.log.info("{s}agent.start provider={s} model={s} channel={s}", .{ prefix, e.provider, e.model, ch });
+                    }
+                } else if (e.bot_account) |bot| {
+                    std.log.info("{s}agent.start provider={s} model={s} bot_account={s}", .{ prefix, e.provider, e.model, bot });
+                } else {
+                    std.log.info("{s}agent.start provider={s} model={s}", .{ prefix, e.provider, e.model });
+                }
+            },
+            .llm_request => |e| std.log.info("{s}llm.request provider={s} model={s} messages={d}", .{ prefix, e.provider, e.model, e.messages_count }),
+            .llm_response => |e| std.log.info("{s}llm.response provider={s} model={s} duration_ms={d} success={}", .{ prefix, e.provider, e.model, e.duration_ms, e.success }),
+            .agent_end => |e| std.log.info("{s}agent.end duration_ms={d}", .{ prefix, e.duration_ms }),
+            .tool_call_start => |e| std.log.info("{s}tool.start tool={s}", .{ prefix, e.tool }),
+            .tool_call => |e| {
+                if (toolDetailForObserver(e.detail)) |detail| {
+                    std.log.info("{s}tool.call tool={s} duration_ms={d} success={} detail={s}", .{ prefix, e.tool, e.duration_ms, e.success, detail });
+                } else {
+                    std.log.info("{s}tool.call tool={s} duration_ms={d} success={}", .{ prefix, e.tool, e.duration_ms, e.success });
+                }
+            },
+            .tool_iterations_exhausted => |e| std.log.info("{s}tool.iterations_exhausted iterations={d}", .{ prefix, e.iterations }),
+            .turn_complete => std.log.info("{s}turn.complete", .{prefix}),
+            .channel_message => |e| std.log.info("{s}channel.message channel={s} direction={s}", .{ prefix, e.channel, e.direction }),
+            .heartbeat_tick => std.log.info("{s}heartbeat.tick", .{prefix}),
+            .err => |e| {
+                if (builtin.is_test) {
+                    std.log.info("{s}error component={s} message={s}", .{ prefix, e.component, e.message });
+                } else {
+                    std.log.err("{s}error component={s} message={s}", .{ prefix, e.component, e.message });
+                }
+            },
+            .subagent_start => |e| {
+                if (eventDetailForObserver(e.task)) |task| {
+                    std.log.info("{s}subagent.start agent_name={s} task={s}", .{ prefix, e.agent_name, task });
+                } else {
+                    std.log.info("{s}subagent.start agent_name={s}", .{ prefix, e.agent_name });
+                }
+            },
+            .cron_job_start => |e| {
+                if (e.channel) |ch| {
+                    if (e.bot_account) |bot| {
+                        if (eventDetailForObserver(e.task)) |task| {
+                            std.log.info("{s}cron.job.start channel={s} bot_account={s} task={s}", .{ prefix, ch, bot, task });
+                        } else {
+                            std.log.info("{s}cron.job.start channel={s} bot_account={s}", .{ prefix, ch, bot });
+                        }
+                    } else if (eventDetailForObserver(e.task)) |task| {
+                        std.log.info("{s}cron.job.start channel={s} task={s}", .{ prefix, ch, task });
+                    } else {
+                        std.log.info("{s}cron.job.start channel={s}", .{ prefix, ch });
+                    }
+                } else if (e.bot_account) |bot| {
+                    if (eventDetailForObserver(e.task)) |task| {
+                        std.log.info("{s}cron.job.start bot_account={s} task={s}", .{ prefix, bot, task });
+                    } else {
+                        std.log.info("{s}cron.job.start bot_account={s}", .{ prefix, bot });
+                    }
+                } else if (eventDetailForObserver(e.task)) |task| {
+                    std.log.info("{s}cron.job.start task={s}", .{ prefix, task });
+                } else {
+                    std.log.info("{s}cron.job.start", .{prefix});
+                }
+            },
+            .skill_load => |e| std.log.info("{s}skill.load name={s} duration_ms={d}", .{ prefix, e.name, e.duration_ms }),
+        }
+        clearTraceIdForEvent(event);
+    }
+
+    fn logRecordMetric(_: *anyopaque, metric: *const ObserverMetric) void {
+        var trace_buf: [48]u8 = undefined;
+        const prefix = formatTracePrefix(&trace_buf, currentLightweightTraceId());
+        switch (metric.*) {
+            .request_latency_ms => |v| std.log.info("{s}metric.request_latency latency_ms={d}", .{ prefix, v }),
+            .tokens_used => |v| std.log.info("{s}metric.tokens_used tokens={d}", .{ prefix, v }),
+            .active_sessions => |v| std.log.info("{s}metric.active_sessions sessions={d}", .{ prefix, v }),
+            .queue_depth => |v| std.log.info("{s}metric.queue_depth depth={d}", .{ prefix, v }),
+        }
+    }
+
+    fn logFlush(_: *anyopaque) void {}
+    fn logName(_: *anyopaque) []const u8 {
+        return "log";
+    }
+    fn logGetTraceId(_: *anyopaque) ?[32]u8 {
+        return currentLightweightTraceId();
+    }
+    fn logSetTraceId(_: *anyopaque, trace_id: [32]u8) void {
+        setLightweightTraceId(trace_id);
+    }
+};
+
+// ── VerboseObserver ──────────────────────────────────────────────────
+
+/// Human-readable progress observer for interactive CLI sessions.
+pub const VerboseObserver = struct {
+    const vtable = Observer.VTable{
+        .record_event = verboseRecordEvent,
+        .record_metric = verboseRecordMetric,
+        .flush = verboseFlush,
+        .name = verboseName,
+        .get_trace_id = verboseGetTraceId,
+        .set_trace_id = verboseSetTraceId,
+    };
+
+    pub fn observer(self: *VerboseObserver) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    fn verboseRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
+        _ = traceIdForEvent(event);
+        var buf: [4096]u8 = undefined;
+        var bw = std_compat.fs.File.stderr().writerStreaming(&buf);
+        const stderr = &bw.interface;
+        switch (event.*) {
+            .llm_request => |e| {
+                stderr.print("> Thinking\n", .{}) catch {};
+                stderr.print("> Send (provider={s}, model={s}, messages={d})\n", .{ e.provider, e.model, e.messages_count }) catch {};
+            },
+            .llm_response => |e| {
+                stderr.print("< Receive (success={}, duration_ms={d})\n", .{ e.success, e.duration_ms }) catch {};
+            },
+            .tool_call_start => |e| {
+                stderr.print("> Tool {s}\n", .{e.tool}) catch {};
+            },
+            .tool_call => |e| {
+                if (toolDetailForObserver(e.detail)) |detail| {
+                    stderr.print("< Tool {s} (success={}, duration_ms={d}, detail={s})\n", .{ e.tool, e.success, e.duration_ms, detail }) catch {};
+                } else {
+                    stderr.print("< Tool {s} (success={}, duration_ms={d})\n", .{ e.tool, e.success, e.duration_ms }) catch {};
+                }
+            },
+            .turn_complete => {
+                stderr.print("< Complete\n", .{}) catch {};
+            },
+            .subagent_start => |e| {
+                stderr.print("> Subagent {s}\n", .{e.agent_name}) catch {};
+            },
+            .cron_job_start => |e| {
+                if (e.channel) |ch| {
+                    stderr.print("> Cron Job (channel={s})\n", .{ch}) catch {};
+                } else {
+                    stderr.print("> Cron Job\n", .{}) catch {};
+                }
+            },
+            .skill_load => |e| {
+                stderr.print("> Skill {s} loaded in {d}ms\n", .{ e.name, e.duration_ms }) catch {};
+            },
+            else => {},
+        }
+        clearTraceIdForEvent(event);
+    }
+
+    fn verboseRecordMetric(_: *anyopaque, _: *const ObserverMetric) void {}
+    fn verboseFlush(_: *anyopaque) void {}
+    fn verboseName(_: *anyopaque) []const u8 {
+        return "verbose";
+    }
+    fn verboseGetTraceId(_: *anyopaque) ?[32]u8 {
+        return currentLightweightTraceId();
+    }
+    fn verboseSetTraceId(_: *anyopaque, trace_id: [32]u8) void {
+        setLightweightTraceId(trace_id);
+    }
+};
+
+// ── MultiObserver ────────────────────────────────────────────────────
+
+/// Fan-out observer — distributes events to multiple backends.
+pub const MultiObserver = struct {
+    observers: []Observer,
+
+    const vtable = Observer.VTable{
+        .record_event = multiRecordEvent,
+        .record_metric = multiRecordMetric,
+        .flush = multiFlush,
+        .name = multiName,
+        .get_trace_id = multiGetTraceId,
+        .set_trace_id = multiSetTraceId,
+    };
+
+    pub fn observer(s: *MultiObserver) Observer {
+        return .{
+            .ptr = @ptrCast(s),
+            .vtable = &vtable,
+        };
+    }
+
+    fn resolve(ptr: *anyopaque) *MultiObserver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn multiRecordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        for (resolve(ptr).observers) |obs| {
+            obs.vtable.record_event(obs.ptr, event);
+        }
+    }
+
+    fn multiRecordMetric(ptr: *anyopaque, metric: *const ObserverMetric) void {
+        for (resolve(ptr).observers) |obs| {
+            obs.vtable.record_metric(obs.ptr, metric);
+        }
+    }
+
+    fn multiFlush(ptr: *anyopaque) void {
+        for (resolve(ptr).observers) |obs| {
+            obs.vtable.flush(obs.ptr);
+        }
+    }
+
+    fn multiName(_: *anyopaque) []const u8 {
+        return "multi";
+    }
+
+    fn multiGetTraceId(ptr: *anyopaque) ?[32]u8 {
+        for (resolve(ptr).observers) |obs| {
+            if (obs.getTraceId()) |id| return id;
+        }
+        return null;
+    }
+
+    fn multiSetTraceId(ptr: *anyopaque, trace_id: [32]u8) void {
+        for (resolve(ptr).observers) |obs| {
+            obs.setTraceId(trace_id);
+        }
+    }
+};
+
+// ── FileObserver ─────────────────────────────────────────────────────
+
+var file_observer_mutex: std_compat.sync.Mutex = .{};
+
+/// Appends events as JSONL to a log file.
+pub const FileObserver = struct {
+    path: []const u8,
+
+    const vtable_impl = Observer.VTable{
+        .record_event = fileRecordEvent,
+        .record_metric = fileRecordMetric,
+        .flush = fileFlush,
+        .name = fileName,
+        .get_trace_id = fileGetTraceId,
+        .set_trace_id = fileSetTraceId,
+    };
+
+    pub fn observer(self: *FileObserver) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable_impl,
+        };
+    }
+
+    fn resolve(ptr: *anyopaque) *FileObserver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn appendToFile(self: *FileObserver, line: []const u8) void {
+        file_observer_mutex.lock();
+        defer file_observer_mutex.unlock();
+
+        self.ensureParentDirExists();
+        fs_compat.appendLine(self.path, line) catch return;
+    }
+
+    fn ensureParentDirExists(self: *FileObserver) void {
+        const parent = std_compat.fs.path.dirname(self.path) orelse return;
+        if (parent.len == 0) return;
+
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => fs_compat.makePath(parent) catch {},
+        };
+    }
+
+    fn fileRecordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        const self = resolve(ptr);
+        const trace_id = traceIdForEvent(event);
+        var buf: [4096]u8 = undefined;
+        const line = switch (event.*) {
+            .agent_start => |e| blk: {
+                if (e.channel) |ch| {
+                    if (e.bot_account) |bot| {
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"agent_start\",\"provider\":{f},\"model\":{f},\"channel\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}), std.json.fmt(ch, .{}), std.json.fmt(bot, .{}) }) catch return;
+                    }
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"agent_start\",\"provider\":{f},\"model\":{f},\"channel\":{f}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}), std.json.fmt(ch, .{}) }) catch return;
+                }
+                break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"agent_start\",\"provider\":{f},\"model\":{f}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}) }) catch return;
+            },
+            .llm_request => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"llm_request\",\"provider\":{f},\"model\":{f},\"messages_count\":{d}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}), e.messages_count }) catch return,
+            .llm_response => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"llm_response\",\"provider\":{f},\"model\":{f},\"duration_ms\":{d},\"success\":{}}}", .{ std.json.fmt(e.provider, .{}), std.json.fmt(e.model, .{}), e.duration_ms, e.success }) catch return,
+            .agent_end => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"agent_end\",\"duration_ms\":{d}}}", .{e.duration_ms}) catch return,
+            .tool_call_start => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call_start\",\"tool\":{f}}}", .{std.json.fmt(e.tool, .{})}) catch return,
+            .tool_call => |e| blk: {
+                if (toolDetailForObserver(e.detail)) |detail| {
+                    break :blk std.fmt.bufPrint(
+                        &buf,
+                        "{{\"event\":\"tool_call\",\"tool\":{f},\"duration_ms\":{d},\"success\":{},\"detail\":{f}}}",
+                        .{ std.json.fmt(e.tool, .{}), e.duration_ms, e.success, std.json.fmt(detail, .{}) },
+                    ) catch return;
+                }
+                break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"tool_call\",\"tool\":{f},\"duration_ms\":{d},\"success\":{}}}", .{ std.json.fmt(e.tool, .{}), e.duration_ms, e.success }) catch return;
+            },
+            .tool_iterations_exhausted => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"tool_iterations_exhausted\",\"iterations\":{d}}}", .{e.iterations}) catch return,
+            .turn_complete => std.fmt.bufPrint(&buf, "{{\"event\":\"turn_complete\"}}", .{}) catch return,
+            .channel_message => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"channel_message\",\"channel\":{f},\"direction\":{f}}}", .{ std.json.fmt(e.channel, .{}), std.json.fmt(e.direction, .{}) }) catch return,
+            .heartbeat_tick => std.fmt.bufPrint(&buf, "{{\"event\":\"heartbeat_tick\"}}", .{}) catch return,
+            .err => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"error\",\"component\":{f},\"message\":{f}}}", .{ std.json.fmt(e.component, .{}), std.json.fmt(e.message, .{}) }) catch return,
+            .subagent_start => |e| blk: {
+                if (eventDetailForObserver(e.task)) |task| {
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"subagent_start\",\"agent_name\":{f},\"task\":{f}}}", .{ std.json.fmt(e.agent_name, .{}), std.json.fmt(task, .{}) }) catch return;
+                }
+                break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"subagent_start\",\"agent_name\":{f}}}", .{std.json.fmt(e.agent_name, .{})}) catch return;
+            },
+            .cron_job_start => |e| blk: {
+                const task = eventDetailForObserver(e.task);
+                if (e.channel) |ch| {
+                    if (e.bot_account) |bot| {
+                        if (task) |task_detail| {
+                            break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f},\"channel\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(task_detail, .{}), std.json.fmt(ch, .{}), std.json.fmt(bot, .{}) }) catch return;
+                        }
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"channel\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(ch, .{}), std.json.fmt(bot, .{}) }) catch return;
+                    }
+                    if (task) |task_detail| {
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f},\"channel\":{f}}}", .{ std.json.fmt(task_detail, .{}), std.json.fmt(ch, .{}) }) catch return;
+                    }
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"channel\":{f}}}", .{std.json.fmt(ch, .{})}) catch return;
+                }
+                if (e.bot_account) |bot| {
+                    if (task) |task_detail| {
+                        break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f},\"bot_account\":{f}}}", .{ std.json.fmt(task_detail, .{}), std.json.fmt(bot, .{}) }) catch return;
+                    }
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"bot_account\":{f}}}", .{std.json.fmt(bot, .{})}) catch return;
+                }
+                if (task) |task_detail| {
+                    break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\",\"task\":{f}}}", .{std.json.fmt(task_detail, .{})}) catch return;
+                }
+                break :blk std.fmt.bufPrint(&buf, "{{\"event\":\"cron_job_start\"}}", .{}) catch return;
+            },
+            .skill_load => |e| std.fmt.bufPrint(&buf, "{{\"event\":\"skill_load\",\"name\":{f},\"duration_ms\":{d}}}", .{ std.json.fmt(e.name, .{}), e.duration_ms }) catch return,
+        };
+        var traced_buf: [4224]u8 = undefined;
+        self.appendToFile(appendTraceIdToJsonObject(&traced_buf, line, trace_id));
+        clearTraceIdForEvent(event);
+    }
+
+    fn fileRecordMetric(ptr: *anyopaque, metric: *const ObserverMetric) void {
+        const self = resolve(ptr);
+        var buf: [512]u8 = undefined;
+        const line = switch (metric.*) {
+            .request_latency_ms => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"request_latency_ms\",\"value\":{d}}}", .{v}) catch return,
+            .tokens_used => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"tokens_used\",\"value\":{d}}}", .{v}) catch return,
+            .active_sessions => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"active_sessions\",\"value\":{d}}}", .{v}) catch return,
+            .queue_depth => |v| std.fmt.bufPrint(&buf, "{{\"metric\":\"queue_depth\",\"value\":{d}}}", .{v}) catch return,
+        };
+        var traced_buf: [640]u8 = undefined;
+        self.appendToFile(appendTraceIdToJsonObject(&traced_buf, line, currentLightweightTraceId()));
+    }
+
+    fn fileFlush(_: *anyopaque) void {
+        // File writes are unbuffered (each event appends directly)
+    }
+
+    fn fileName(_: *anyopaque) []const u8 {
+        return "file";
+    }
+
+    fn fileGetTraceId(_: *anyopaque) ?[32]u8 {
+        return currentLightweightTraceId();
+    }
+    fn fileSetTraceId(_: *anyopaque, trace_id: [32]u8) void {
+        setLightweightTraceId(trace_id);
+    }
+};
+
+/// Factory: create observer from config backend string.
+fn createObserver(backend: []const u8) []const u8 {
+    if (std.mem.eql(u8, backend, "log")) return "log";
+    if (std.mem.eql(u8, backend, "verbose")) return "verbose";
+    if (std.mem.eql(u8, backend, "file")) return "file";
+    if (std.mem.eql(u8, backend, "multi")) return "multi";
+    if (std.mem.eql(u8, backend, "otel") or std.mem.eql(u8, backend, "otlp")) return "otel";
+    if (std.mem.eql(u8, backend, "none") or std.mem.eql(u8, backend, "noop")) return "noop";
+    return "noop"; // fallback
+}
+
+// ── OtelObserver ─────────────────────────────────────────────────────
+
+/// OpenTelemetry key-value attribute.
+pub const OtelAttribute = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// A single OTLP span with timing and attributes.
+pub const OtelSpan = struct {
+    trace_id: [32]u8,
+    span_id: [16]u8,
+    name: []const u8,
+    start_ns: u64,
+    end_ns: u64,
+    attributes: std.ArrayListUnmanaged(OtelAttribute),
+
+    pub fn deinit(self: *OtelSpan, allocator: std.mem.Allocator) void {
+        for (self.attributes.items) |attr| {
+            allocator.free(attr.key);
+            allocator.free(attr.value);
+        }
+        self.attributes.deinit(allocator);
+    }
+};
+
+const http_util = @import("http_util.zig");
+
+/// OpenTelemetry OTLP/HTTP observer — batches spans and exports via JSON.
+pub const OtelObserver = struct {
+    pub const HeaderEntry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    const TraceContext = struct {
+        trace_id: [32]u8 = @as([32]u8, @splat(0)),
+        start_ns: u64 = 0,
+        active: bool = false,
+    };
+
+    allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    service_name: []const u8,
+    headers: []const []const u8,
+    spans: std.ArrayListUnmanaged(OtelSpan),
+    trace_contexts: std.AutoHashMapUnmanaged(std.Thread.Id, TraceContext),
+    mutex: std_compat.sync.Mutex,
+    requests_total: Atomic(u64),
+    errors_total: Atomic(u64),
+
+    const max_batch_size: usize = 10;
+
+    const vtable_impl = Observer.VTable{
+        .record_event = otelRecordEvent,
+        .record_metric = otelRecordMetric,
+        .flush = otelFlush,
+        .name = otelName,
+        .get_trace_id = otelGetTraceId,
+        .set_trace_id = otelSetTraceId,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, endpoint: ?[]const u8, service_name: ?[]const u8) OtelObserver {
+        return .{
+            .allocator = allocator,
+            .endpoint = endpoint orelse "https://localhost:4318",
+            .service_name = service_name orelse "nullclaw",
+            .headers = &.{},
+            .spans = .empty,
+            .trace_contexts = .{},
+            .mutex = .{},
+            .requests_total = Atomic(u64).init(0),
+            .errors_total = Atomic(u64).init(0),
+        };
+    }
+
+    pub fn initWithHeaders(
+        allocator: std.mem.Allocator,
+        endpoint: ?[]const u8,
+        service_name: ?[]const u8,
+        headers: anytype,
+    ) !OtelObserver {
+        const resolved_endpoint = endpoint orelse "http://localhost:4318";
+        if (!config_types.DiagnosticsConfig.isValidOtelEndpoint(resolved_endpoint)) {
+            return error.InvalidOtelEndpoint;
+        }
+        for (headers) |header| {
+            if (!config_types.DiagnosticsConfig.isValidOtelHeaderName(header.key) or
+                !config_types.DiagnosticsConfig.isValidOtelHeaderValue(header.value))
+            {
+                return error.InvalidOtelHeader;
+            }
+        }
+
+        var self = init(allocator, resolved_endpoint, service_name);
+        if (headers.len == 0) return self;
+
+        const owned_headers = try allocator.alloc([]const u8, headers.len);
+        errdefer allocator.free(owned_headers);
+
+        var built: usize = 0;
+        errdefer {
+            for (owned_headers[0..built]) |header| {
+                allocator.free(header);
+            }
+        }
+
+        for (headers, 0..) |header, i| {
+            owned_headers[i] = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ header.key, header.value });
+            built += 1;
+        }
+
+        self.headers = owned_headers;
+        return self;
+    }
+
+    pub fn observer(self: *OtelObserver) Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable_impl,
+        };
+    }
+
+    pub fn deinit(self: *OtelObserver) void {
+        for (self.spans.items) |*span| {
+            span.deinit(self.allocator);
+        }
+        self.spans.deinit(self.allocator);
+        self.trace_contexts.deinit(self.allocator);
+        for (self.headers) |header| {
+            self.allocator.free(header);
+        }
+        if (self.headers.len > 0) {
+            self.allocator.free(self.headers);
+        }
+        self.headers = &.{};
+    }
+
+    fn resolve(ptr: *anyopaque) *OtelObserver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    /// Generate random hex ID into a buffer.
+    fn randomHex(buf: []u8) void {
+        var raw: [16]u8 = undefined;
+        const needed = buf.len / 2;
+        std_compat.crypto.random.bytes(raw[0..needed]);
+        const hex = "0123456789abcdef";
+        for (0..needed) |i| {
+            buf[i * 2] = hex[raw[i] >> 4];
+            buf[i * 2 + 1] = hex[raw[i] & 0x0f];
+        }
+    }
+
+    fn nowNs() u64 {
+        return @intCast(std_compat.time.nanoTimestamp());
+    }
+
+    fn contextForCurrentThread(self: *OtelObserver, now: u64) ?*TraceContext {
+        const thread_id = std.Thread.getCurrentId();
+        const gop = self.trace_contexts.getOrPut(self.allocator, thread_id) catch return null;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        }
+        if (!gop.value_ptr.active) {
+            randomHex(&gop.value_ptr.trace_id);
+            gop.value_ptr.start_ns = now;
+            gop.value_ptr.active = true;
+        }
+        return gop.value_ptr;
+    }
+
+    fn startCurrentTrace(self: *OtelObserver, now: u64) void {
+        const ctx = self.contextForCurrentThread(now) orelse return;
+        randomHex(&ctx.trace_id);
+        ctx.start_ns = now;
+        ctx.active = true;
+    }
+
+    fn clearCurrentTrace(self: *OtelObserver) void {
+        _ = self.trace_contexts.fetchRemove(std.Thread.getCurrentId());
+    }
+
+    fn otelGetTraceId(ptr: *anyopaque) ?[32]u8 {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.contextForCurrentThread(nowNs())) |ctx| {
+            if (ctx.active) return ctx.trace_id;
+        }
+        return null;
+    }
+
+    fn otelSetTraceId(ptr: *anyopaque, trace_id: [32]u8) void {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = nowNs();
+        if (self.contextForCurrentThread(now)) |ctx| {
+            ctx.trace_id = trace_id;
+            ctx.start_ns = now;
+            ctx.active = true;
+        }
+    }
+
+    fn addSpan(self: *OtelObserver, name: []const u8, start_ns: u64, end_ns: u64, attrs: []const OtelAttribute) void {
+        var span_id: [16]u8 = undefined;
+        randomHex(&span_id);
+        const trace_ctx = self.contextForCurrentThread(if (start_ns > 0) start_ns else end_ns);
+        const trace_id = if (trace_ctx) |ctx| ctx.trace_id else @as([32]u8, @splat(0));
+
+        var attributes: std.ArrayListUnmanaged(OtelAttribute) = .empty;
+        for (attrs) |attr| {
+            const key_owned = self.allocator.dupe(u8, attr.key) catch break;
+            const value_owned = self.allocator.dupe(u8, attr.value) catch {
+                self.allocator.free(key_owned);
+                break;
+            };
+            attributes.append(self.allocator, .{
+                .key = key_owned,
+                .value = value_owned,
+            }) catch {
+                self.allocator.free(value_owned);
+                self.allocator.free(key_owned);
+                break;
+            };
+        }
+
+        self.spans.append(self.allocator, .{
+            .trace_id = trace_id,
+            .span_id = span_id,
+            .name = name,
+            .start_ns = start_ns,
+            .end_ns = end_ns,
+            .attributes = attributes,
+        }) catch {
+            for (attributes.items) |attr| {
+                self.allocator.free(attr.key);
+                self.allocator.free(attr.value);
+            }
+            attributes.deinit(self.allocator);
+            return;
+        };
+
+        if (self.spans.items.len >= max_batch_size) {
+            self.flushLocked();
+        }
+    }
+
+    fn otelRecordEvent(ptr: *anyopaque, event: *const ObserverEvent) void {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now = nowNs();
+
+        switch (event.*) {
+            .agent_start => |e| {
+                self.startCurrentTrace(now);
+                var attrs: [4]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "provider", .value = e.provider };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "model", .value = e.model };
+                attr_len += 1;
+                if (e.channel) |ch| {
+                    attrs[attr_len] = .{ .key = "channel", .value = ch };
+                    attr_len += 1;
+                }
+                if (e.bot_account) |bot| {
+                    attrs[attr_len] = .{ .key = "bot_account", .value = bot };
+                    attr_len += 1;
+                }
+                self.addSpan("agent.start", now, now, attrs[0..attr_len]);
+            },
+            .agent_end => |e| {
+                const start = if (self.contextForCurrentThread(now)) |ctx| ctx.start_ns else now;
+                var dur_buf: [20]u8 = undefined;
+                const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
+                var attrs: [2]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "duration_ms", .value = dur_str };
+                attr_len += 1;
+                if (e.tokens_used) |tokens_used| {
+                    var token_buf: [20]u8 = undefined;
+                    const token_str = std.fmt.bufPrint(&token_buf, "{d}", .{tokens_used}) catch "0";
+                    attrs[attr_len] = .{ .key = "tokens_used", .value = token_str };
+                    attr_len += 1;
+                }
+                self.addSpan("agent.end", start, now, attrs[0..attr_len]);
+                self.clearCurrentTrace();
+                self.flushLocked();
+            },
+            .llm_request => |e| {
+                _ = self.requests_total.fetchAdd(1, .monotonic);
+                var attrs: [4]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "provider", .value = e.provider };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "model", .value = e.model };
+                attr_len += 1;
+                var count_buf: [20]u8 = undefined;
+                const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{e.messages_count}) catch "0";
+                attrs[attr_len] = .{ .key = "messages_count", .value = count_str };
+                attr_len += 1;
+                if (llmDetailForObserver(e.detail)) |detail| {
+                    attrs[attr_len] = .{ .key = "detail", .value = detail };
+                    attr_len += 1;
+                }
+                self.addSpan("llm.request", now, now, attrs[0..attr_len]);
+            },
+            .llm_response => |e| {
+                if (!e.success) {
+                    _ = self.errors_total.fetchAdd(1, .monotonic);
+                }
+                var dur_buf: [20]u8 = undefined;
+                const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
+                var attrs: [9]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "provider", .value = e.provider };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "model", .value = e.model };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "duration_ms", .value = dur_str };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "success", .value = if (e.success) "true" else "false" };
+                attr_len += 1;
+                if (e.prompt_tokens) |prompt_tokens| {
+                    var prompt_buf: [20]u8 = undefined;
+                    const prompt_str = std.fmt.bufPrint(&prompt_buf, "{d}", .{prompt_tokens}) catch "0";
+                    attrs[attr_len] = .{ .key = "prompt_tokens", .value = prompt_str };
+                    attr_len += 1;
+                }
+                if (e.completion_tokens) |completion_tokens| {
+                    var completion_buf: [20]u8 = undefined;
+                    const completion_str = std.fmt.bufPrint(&completion_buf, "{d}", .{completion_tokens}) catch "0";
+                    attrs[attr_len] = .{ .key = "completion_tokens", .value = completion_str };
+                    attr_len += 1;
+                }
+                if (e.total_tokens) |total_tokens| {
+                    var total_buf: [20]u8 = undefined;
+                    const total_str = std.fmt.bufPrint(&total_buf, "{d}", .{total_tokens}) catch "0";
+                    attrs[attr_len] = .{ .key = "total_tokens", .value = total_str };
+                    attr_len += 1;
+                }
+                if (e.error_message) |error_message| {
+                    attrs[attr_len] = .{ .key = "error_message", .value = error_message };
+                    attr_len += 1;
+                }
+                if (llmDetailForObserver(e.detail)) |detail| {
+                    attrs[attr_len] = .{ .key = "detail", .value = detail };
+                    attr_len += 1;
+                }
+                self.addSpan("llm.response", now -| (e.duration_ms * 1_000_000), now, attrs[0..attr_len]);
+            },
+            .tool_call_start => |e| {
+                self.addSpan("tool.start", now, now, &.{
+                    .{ .key = "tool", .value = e.tool },
+                });
+            },
+            .tool_call => |e| {
+                var dur_buf: [20]u8 = undefined;
+                const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
+                var attrs: [5]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "tool", .value = e.tool };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "duration_ms", .value = dur_str };
+                attr_len += 1;
+                attrs[attr_len] = .{ .key = "success", .value = if (e.success) "true" else "false" };
+                attr_len += 1;
+                if (toolDetailForObserver(e.args)) |args| {
+                    attrs[attr_len] = .{ .key = "args", .value = args };
+                    attr_len += 1;
+                }
+                if (toolDetailForObserver(e.detail)) |detail| {
+                    attrs[attr_len] = .{ .key = "detail", .value = detail };
+                    attr_len += 1;
+                }
+                self.addSpan("tool.call", now -| (e.duration_ms * 1_000_000), now, attrs[0..attr_len]);
+            },
+            .tool_iterations_exhausted => |e| {
+                var iter_buf: [20]u8 = undefined;
+                const iter_str = std.fmt.bufPrint(&iter_buf, "{d}", .{e.iterations}) catch "0";
+                self.addSpan("tool.iterations_exhausted", now, now, &.{
+                    .{ .key = "iterations", .value = iter_str },
+                });
+            },
+            .turn_complete => {
+                self.addSpan("turn.complete", now, now, &.{});
+                self.clearCurrentTrace();
+                self.flushLocked();
+            },
+            .channel_message => |e| {
+                self.addSpan("channel.message", now, now, &.{
+                    .{ .key = "channel", .value = e.channel },
+                    .{ .key = "direction", .value = e.direction },
+                });
+            },
+            .heartbeat_tick => {
+                self.addSpan("heartbeat.tick", now, now, &.{});
+            },
+            .err => |e| {
+                _ = self.errors_total.fetchAdd(1, .monotonic);
+                self.addSpan("error", now, now, &.{
+                    .{ .key = "component", .value = e.component },
+                    .{ .key = "message", .value = e.message },
+                });
+            },
+            .subagent_start => |e| {
+                var attrs: [2]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                attrs[attr_len] = .{ .key = "agent_name", .value = e.agent_name };
+                attr_len += 1;
+                if (eventDetailForObserver(e.task)) |task| {
+                    attrs[attr_len] = .{ .key = "task", .value = task };
+                    attr_len += 1;
+                }
+                self.addSpan("subagent.start", now, now, attrs[0..attr_len]);
+            },
+            .cron_job_start => |e| {
+                self.startCurrentTrace(now);
+                var attrs: [3]OtelAttribute = undefined;
+                var attr_len: usize = 0;
+                if (eventDetailForObserver(e.task)) |task| {
+                    attrs[attr_len] = .{ .key = "task", .value = task };
+                    attr_len += 1;
+                }
+                if (e.channel) |ch| {
+                    attrs[attr_len] = .{ .key = "channel", .value = ch };
+                    attr_len += 1;
+                }
+                if (e.bot_account) |bot| {
+                    attrs[attr_len] = .{ .key = "bot_account", .value = bot };
+                    attr_len += 1;
+                }
+                self.addSpan("cron.job.start", now, now, attrs[0..attr_len]);
+            },
+            .skill_load => |e| {
+                var dur_buf: [20]u8 = undefined;
+                const dur_str = std.fmt.bufPrint(&dur_buf, "{d}", .{e.duration_ms}) catch "0";
+                self.addSpan("skill.load", now -| (e.duration_ms * 1_000_000), now, &.{
+                    .{ .key = "name", .value = e.name },
+                    .{ .key = "duration_ms", .value = dur_str },
+                });
+            },
+        }
+    }
+
+    fn otelRecordMetric(ptr: *anyopaque, metric: *const ObserverMetric) void {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now = nowNs();
+
+        switch (metric.*) {
+            .request_latency_ms => |v| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+                self.addSpan("metric.request_latency_ms", now, now, &.{
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .tokens_used => |v| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+                self.addSpan("metric.tokens_used", now, now, &.{
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .active_sessions => |v| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+                self.addSpan("metric.active_sessions", now, now, &.{
+                    .{ .key = "value", .value = s },
+                });
+            },
+            .queue_depth => |v| {
+                var buf: [20]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch return;
+                self.addSpan("metric.queue_depth", now, now, &.{
+                    .{ .key = "value", .value = s },
+                });
+            },
+        }
+    }
+
+    /// Serialize all pending spans as OTLP/HTTP JSON payload.
+    pub fn serializeSpans(self: *OtelObserver) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(self.allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        const w = &buf_writer.writer;
+
+        try w.writeAll("{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"");
+        try w.writeAll(self.service_name);
+        try w.writeAll("\"}}]},\"scopeSpans\":[{\"spans\":[");
+
+        for (self.spans.items, 0..) |span, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll("{\"traceId\":\"");
+            try w.writeAll(&span.trace_id);
+            try w.writeAll("\",\"spanId\":\"");
+            try w.writeAll(&span.span_id);
+            try w.writeAll("\",\"name\":\"");
+            try w.writeAll(span.name);
+            try w.writeAll("\",\"startTimeUnixNano\":\"");
+            try w.print("{d}", .{span.start_ns});
+            try w.writeAll("\",\"endTimeUnixNano\":\"");
+            try w.print("{d}", .{span.end_ns});
+            try w.writeAll("\",\"attributes\":[");
+
+            for (span.attributes.items, 0..) |attr, j| {
+                if (j > 0) try w.writeByte(',');
+                try w.print(
+                    "{{\"key\":{f},\"value\":{{\"stringValue\":{f}}}}}",
+                    .{ std.json.fmt(attr.key, .{}), std.json.fmt(attr.value, .{}) },
+                );
+            }
+
+            try w.writeAll("],\"status\":{\"code\":1}}");
+        }
+
+        try w.writeAll("]}]}]}");
+
+        buf = buf_writer.toArrayList();
+        return buf.toOwnedSlice(self.allocator);
+    }
+
+    /// Flush pending spans to the OTLP endpoint. Caller must hold the mutex.
+    fn flushLocked(self: *OtelObserver) void {
+        if (self.spans.items.len == 0) return;
+
+        const payload = self.serializeSpans() catch return;
+        defer self.allocator.free(payload);
+
+        const url_buf = std.fmt.allocPrint(self.allocator, "{s}/v1/traces", .{self.endpoint}) catch return;
+        defer self.allocator.free(url_buf);
+
+        // Best-effort send; free response if successful
+        if (http_util.curlPost(self.allocator, url_buf, payload, self.headers)) |curl_resp| {
+            self.allocator.free(curl_resp);
+        } else |_| {}
+
+        // Clear spans regardless of delivery success to prevent unbounded growth
+        for (self.spans.items) |*span| {
+            span.deinit(self.allocator);
+        }
+        self.spans.clearRetainingCapacity();
+    }
+
+    fn otelFlush(ptr: *anyopaque) void {
+        const self = resolve(ptr);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.flushLocked();
+    }
+
+    fn otelName(_: *anyopaque) []const u8 {
+        return "otel";
+    }
+};
+
+/// Heap-owned runtime observer that wires config-selected backends into long-lived
+/// agent/session runtimes without dangling vtable pointers.
+pub const RuntimeObserver = struct {
+    pub const Config = struct {
+        workspace_dir: []const u8,
+        backend: []const u8 = "none",
+        file_path: ?[]const u8 = null,
+        otel_endpoint: ?[]const u8 = null,
+        otel_service_name: ?[]const u8 = null,
+    };
+
+    allocator: std.mem.Allocator,
+    active_backend: Backend = .noop,
+    primary_backend: Backend = .noop,
+    noop: NoopObserver = .{},
+    log: LogObserver = .{},
+    verbose: VerboseObserver = .{},
+    file: ?FileObserver = null,
+    otel: ?OtelObserver = null,
+    multi: ?MultiObserver = null,
+    multi_observers: []Observer = &.{},
+    owned_file_path: ?[]u8 = null,
+
+    const Backend = enum {
+        noop,
+        log,
+        verbose,
+        file,
+        otel,
+        multi,
+    };
+
+    pub fn create(
+        allocator: std.mem.Allocator,
+        config: Config,
+        otel_headers: anytype,
+        extra_observers: []const Observer,
+    ) !*RuntimeObserver {
+        const self = try allocator.create(RuntimeObserver);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator };
+        errdefer self.deinit();
+        try self.initInPlace(config, otel_headers, extra_observers);
+        return self;
+    }
+
+    pub fn destroy(self: *RuntimeObserver) void {
+        self.deinit();
+        self.allocator.destroy(self);
+    }
+
+    pub fn observer(self: *RuntimeObserver) Observer {
+        return switch (self.active_backend) {
+            .noop => self.noop.observer(),
+            .log => self.log.observer(),
+            .verbose => self.verbose.observer(),
+            .file => self.file.?.observer(),
+            .otel => self.otel.?.observer(),
+            .multi => self.multi.?.observer(),
+        };
+    }
+
+    pub fn backendObserver(self: *RuntimeObserver) Observer {
+        return switch (self.primary_backend) {
+            .noop => self.noop.observer(),
+            .log => self.log.observer(),
+            .verbose => self.verbose.observer(),
+            .file => self.file.?.observer(),
+            .otel => self.otel.?.observer(),
+            .multi => unreachable,
+        };
+    }
+
+    pub fn deinit(self: *RuntimeObserver) void {
+        self.observer().flush();
+        if (self.otel) |*otel| {
+            otel.deinit();
+            self.otel = null;
+        }
+        if (self.multi_observers.len > 0) {
+            self.allocator.free(self.multi_observers);
+            self.multi_observers = &.{};
+        }
+        self.multi = null;
+        if (self.owned_file_path) |path| {
+            self.allocator.free(path);
+            self.owned_file_path = null;
+        }
+        self.file = null;
+        self.active_backend = .noop;
+        self.primary_backend = .noop;
+    }
+
+    fn initInPlace(
+        self: *RuntimeObserver,
+        config: Config,
+        otel_headers: anytype,
+        extra_observers: []const Observer,
+    ) !void {
+        const backend = createObserver(config.backend);
+        const include_base = !std.mem.eql(u8, backend, "multi");
+
+        if (std.mem.eql(u8, backend, "log")) {
+            self.primary_backend = .log;
+        } else if (std.mem.eql(u8, backend, "verbose")) {
+            self.primary_backend = .verbose;
+        } else if (std.mem.eql(u8, backend, "file")) {
+            self.owned_file_path = if (config.file_path) |path|
+                try self.allocator.dupe(u8, path)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}/nullclaw-observability.jsonl", .{config.workspace_dir});
+            self.file = .{ .path = self.owned_file_path.? };
+            self.primary_backend = .file;
+        } else if (std.mem.eql(u8, backend, "otel")) {
+            self.otel = try OtelObserver.initWithHeaders(
+                self.allocator,
+                config.otel_endpoint,
+                config.otel_service_name,
+                otel_headers,
+            );
+            self.primary_backend = .otel;
+        } else {
+            self.primary_backend = .noop;
+        }
+        self.active_backend = self.primary_backend;
+
+        const should_include_base = include_base and self.primary_backend != .noop;
+        const total = extra_observers.len + @as(usize, if (should_include_base) 1 else 0);
+        if (total == 0) return;
+
+        self.multi_observers = try self.allocator.alloc(Observer, total);
+        var idx: usize = 0;
+        if (should_include_base) {
+            self.multi_observers[idx] = self.baseObserver();
+            idx += 1;
+        }
+        for (extra_observers) |extra| {
+            self.multi_observers[idx] = extra;
+            idx += 1;
+        }
+        self.multi = .{ .observers = self.multi_observers };
+        self.active_backend = .multi;
+    }
+
+    fn baseObserver(self: *RuntimeObserver) Observer {
+        return switch (self.primary_backend) {
+            .noop => self.noop.observer(),
+            .log => self.log.observer(),
+            .verbose => self.verbose.observer(),
+            .file => self.file.?.observer(),
+            .otel => self.otel.?.observer(),
+            .multi => unreachable,
+        };
+    }
+};
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+test "NoopObserver name" {
+    var noop = NoopObserver{};
+    const obs = noop.observer();
+    try std.testing.expectEqualStrings("noop", obs.getName());
+}
+
+test "NoopObserver does not panic on events" {
+    var noop = NoopObserver{};
+    const obs = noop.observer();
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    const metric = ObserverMetric{ .tokens_used = 42 };
+    obs.recordMetric(&metric);
+    obs.flush();
+}
+
+test "LogObserver name" {
+    var log_obs = LogObserver{};
+    const obs = log_obs.observer();
+    try std.testing.expectEqualStrings("log", obs.getName());
+}
+
+test "LogObserver trace id roundtrip" {
+    var log_obs = LogObserver{};
+    const obs = log_obs.observer();
+    setLightweightTraceId(null);
+    defer setLightweightTraceId(null);
+
+    const trace_id = @as([32]u8, @splat('b'));
+    obs.setTraceId(trace_id);
+    try std.testing.expectEqual(trace_id, obs.getTraceId().?);
+}
+
+test "LogObserver does not panic on events" {
+    var log_obs = LogObserver{};
+    const obs = log_obs.observer();
+
+    const events = [_]ObserverEvent{
+        .{ .agent_start = .{ .provider = "openrouter", .model = "claude" } },
+        .{ .llm_request = .{ .provider = "openrouter", .model = "claude", .messages_count = 2 } },
+        .{ .llm_response = .{ .provider = "openrouter", .model = "claude", .duration_ms = 250, .success = true, .error_message = null } },
+        .{ .agent_end = .{ .duration_ms = 500, .tokens_used = 100 } },
+        .{ .tool_call_start = .{ .tool = "shell" } },
+        .{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = false } },
+        .{ .turn_complete = {} },
+        .{ .channel_message = .{ .channel = "telegram", .direction = "outbound" } },
+        .{ .heartbeat_tick = {} },
+        .{ .err = .{ .component = "provider", .message = "timeout" } },
+    };
+
+    for (&events) |*event| {
+        obs.recordEvent(event);
+    }
+
+    const metrics = [_]ObserverMetric{
+        .{ .request_latency_ms = 2000 },
+        .{ .tokens_used = 0 },
+        .{ .active_sessions = 1 },
+        .{ .queue_depth = 999 },
+    };
+    for (&metrics) |*metric| {
+        obs.recordMetric(metric);
+    }
+}
+
+test "VerboseObserver name" {
+    var verbose = VerboseObserver{};
+    const obs = verbose.observer();
+    try std.testing.expectEqualStrings("verbose", obs.getName());
+}
+
+test "MultiObserver name" {
+    var multi = MultiObserver{ .observers = &.{} };
+    const obs = multi.observer();
+    try std.testing.expectEqualStrings("multi", obs.getName());
+}
+
+test "MultiObserver empty does not panic" {
+    var multi = MultiObserver{ .observers = @constCast(&[_]Observer{}) };
+    const obs = multi.observer();
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    const metric = ObserverMetric{ .tokens_used = 10 };
+    obs.recordMetric(&metric);
+    obs.flush();
+}
+
+test "MultiObserver fans out events" {
+    var noop1 = NoopObserver{};
+    var noop2 = NoopObserver{};
+    var observers_arr = [_]Observer{ noop1.observer(), noop2.observer() };
+    var multi = MultiObserver{ .observers = &observers_arr };
+    const obs = multi.observer();
+
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    obs.recordEvent(&event);
+    obs.recordEvent(&event);
+    // No panic = success (NoopObserver doesn't count but we verify fan-out doesn't crash)
+}
+
+test "createObserver factory" {
+    try std.testing.expectEqualStrings("log", createObserver("log"));
+    try std.testing.expectEqualStrings("verbose", createObserver("verbose"));
+    try std.testing.expectEqualStrings("file", createObserver("file"));
+    try std.testing.expectEqualStrings("multi", createObserver("multi"));
+    try std.testing.expectEqualStrings("otel", createObserver("otel"));
+    try std.testing.expectEqualStrings("otel", createObserver("otlp"));
+    try std.testing.expectEqualStrings("noop", createObserver("none"));
+    try std.testing.expectEqualStrings("noop", createObserver("noop"));
+    try std.testing.expectEqualStrings("noop", createObserver("unknown_backend"));
+    try std.testing.expectEqualStrings("noop", createObserver(""));
+}
+
+test "FileObserver name" {
+    var file_obs = FileObserver{ .path = "/tmp/nullclaw_test_obs.jsonl" };
+    const obs = file_obs.observer();
+    try std.testing.expectEqualStrings("file", obs.getName());
+}
+
+test "FileObserver does not panic on events" {
+    var file_obs = FileObserver{ .path = "/tmp/nullclaw_test_obs.jsonl" };
+    const obs = file_obs.observer();
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    const metric = ObserverMetric{ .tokens_used = 42 };
+    obs.recordMetric(&metric);
+    obs.flush();
+}
+
+test "FileObserver handles all event types" {
+    var file_obs = FileObserver{ .path = "/tmp/nullclaw_test_obs2.jsonl" };
+    const obs = file_obs.observer();
+    const events = [_]ObserverEvent{
+        .{ .agent_start = .{ .provider = "test", .model = "test" } },
+        .{ .llm_request = .{ .provider = "test", .model = "test", .messages_count = 1 } },
+        .{ .llm_response = .{ .provider = "test", .model = "test", .duration_ms = 100, .success = true, .error_message = null } },
+        .{ .agent_end = .{ .duration_ms = 1000, .tokens_used = 500 } },
+        .{ .tool_call_start = .{ .tool = "shell" } },
+        .{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } },
+        .{ .turn_complete = {} },
+        .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
+        .{ .heartbeat_tick = {} },
+        .{ .err = .{ .component = "test", .message = "error" } },
+        .{ .subagent_start = .{ .agent_name = "worker", .task = "review diff" } },
+        .{ .cron_job_start = .{ .task = "nightly report", .channel = "telegram", .bot_account = "bot-a" } },
+        .{ .skill_load = .{ .name = "reviewer", .duration_ms = 12 } },
+    };
+    for (&events) |*event| {
+        obs.recordEvent(event);
+    }
+}
+
+test "FileObserver tool_call detail is persisted as JSON string" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_tool_detail.jsonl" });
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const event = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 7,
+        .success = false,
+        .detail = "exit code 1: \"permission denied\"",
+    } };
+    obs.recordEvent(&event);
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"tool_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"detail\":\"exit code 1: \\\"permission denied\\\"\"") != null);
+}
+
+test "FileObserver persists trace_id when set" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setLightweightTraceId(null);
+    defer setLightweightTraceId(null);
+
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/obs_trace.jsonl", .{base});
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const trace_id = @as([32]u8, @splat('a'));
+    obs.setTraceId(trace_id);
+
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"trace_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"") != null);
+}
+
+test "FileObserver serializes concurrent appends" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_parallel.jsonl" });
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+
+    const Worker = struct {
+        fn run(observer: Observer, tool: []const u8) void {
+            var i: usize = 0;
+            while (i < 32) : (i += 1) {
+                const event = ObserverEvent{ .tool_call = .{
+                    .tool = tool,
+                    .duration_ms = @intCast(i),
+                    .success = true,
+                } };
+                observer.recordEvent(&event);
+            }
+        }
+    };
+
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{ obs, "shell" });
+    const thread_b = try std.Thread.spawn(.{}, Worker.run, .{ obs, "web_fetch" });
+    thread_a.join();
+    thread_b.join();
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 16 * 1024);
+    defer allocator.free(content);
+
+    var line_count: usize = 0;
+    for (content) |byte| {
+        if (byte == '\n') line_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 64), line_count);
+}
+
+test "FileObserver creates parent directories on first write" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "nested", "diagnostics", "obs.jsonl" });
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"heartbeat_tick\"") != null);
+}
+
+test "FileObserver emits valid escaped JSONL" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_escaped.jsonl" });
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const event = ObserverEvent{ .err = .{
+        .component = "provider\"alpha",
+        .message = "line1\nline2\\tail",
+    } };
+    obs.recordEvent(&event);
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(content);
+
+    const line = std_compat.mem.trimRight(u8, content, "\n");
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqualStrings("error", parsed.value.object.get("event").?.string);
+    try std.testing.expectEqualStrings("provider\"alpha", parsed.value.object.get("component").?.string);
+    try std.testing.expectEqualStrings("line1\nline2\\tail", parsed.value.object.get("message").?.string);
+}
+
+test "FileObserver persists task details for subagent and cron events" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_task_events.jsonl" });
+    defer allocator.free(path);
+
+    var file_obs = FileObserver{ .path = path };
+    const obs = file_obs.observer();
+    const subagent = ObserverEvent{ .subagent_start = .{
+        .agent_name = "delegate",
+        .task = "inspect scheduler telemetry",
+    } };
+    const cron = ObserverEvent{ .cron_job_start = .{
+        .task = "send daily digest",
+        .channel = "telegram",
+        .bot_account = "bot-main",
+    } };
+    obs.recordEvent(&subagent);
+    obs.recordEvent(&cron);
+
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"subagent_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"task\":\"inspect scheduler telemetry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"event\":\"cron_job_start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"channel\":\"telegram\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"bot_account\":\"bot-main\"") != null);
+}
+
+// ── Additional observability tests ──────────────────────────────
+
+test "VerboseObserver does not panic on events" {
+    var verbose = VerboseObserver{};
+    const obs = verbose.observer();
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    const metric = ObserverMetric{ .tokens_used = 42 };
+    obs.recordMetric(&metric);
+    obs.flush();
+}
+
+test "VerboseObserver handles all event types" {
+    var verbose = VerboseObserver{};
+    const obs = verbose.observer();
+    const events = [_]ObserverEvent{
+        .{ .llm_request = .{ .provider = "test", .model = "test", .messages_count = 1 } },
+        .{ .llm_response = .{ .provider = "test", .model = "test", .duration_ms = 100, .success = true, .error_message = null } },
+        .{ .tool_call_start = .{ .tool = "shell" } },
+        .{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } },
+        .{ .turn_complete = {} },
+        .{ .agent_start = .{ .provider = "test", .model = "test" } },
+        .{ .agent_end = .{ .duration_ms = 1000, .tokens_used = 500 } },
+        .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
+        .{ .heartbeat_tick = {} },
+        .{ .err = .{ .component = "test", .message = "error" } },
+        .{ .subagent_start = .{ .agent_name = "worker", .task = "review diff" } },
+        .{ .cron_job_start = .{ .task = "nightly report", .channel = "telegram", .bot_account = "bot-a" } },
+        .{ .skill_load = .{ .name = "reviewer", .duration_ms = 12 } },
+    };
+    for (&events) |*event| {
+        obs.recordEvent(event);
+    }
+}
+
+test "MultiObserver fans out metrics" {
+    var noop1 = NoopObserver{};
+    var noop2 = NoopObserver{};
+    var observers_arr = [_]Observer{ noop1.observer(), noop2.observer() };
+    var multi = MultiObserver{ .observers = &observers_arr };
+    const obs = multi.observer();
+
+    const metric = ObserverMetric{ .request_latency_ms = 500 };
+    obs.recordMetric(&metric);
+    obs.recordMetric(&metric);
+    // No panic = success
+}
+
+test "MultiObserver fans out flush" {
+    var noop1 = NoopObserver{};
+    var noop2 = NoopObserver{};
+    var observers_arr = [_]Observer{ noop1.observer(), noop2.observer() };
+    var multi = MultiObserver{ .observers = &observers_arr };
+    const obs = multi.observer();
+
+    obs.flush();
+    obs.flush();
+    // No panic = success
+}
+
+test "ObserverEvent agent_start fields" {
+    const event = ObserverEvent{ .agent_start = .{ .provider = "openrouter", .model = "claude-sonnet" } };
+    switch (event) {
+        .agent_start => |e| {
+            try std.testing.expectEqualStrings("openrouter", e.provider);
+            try std.testing.expectEqualStrings("claude-sonnet", e.model);
+        },
+        else => unreachable,
+    }
+}
+
+test "ObserverEvent agent_end fields" {
+    const event = ObserverEvent{ .agent_end = .{ .duration_ms = 1500, .tokens_used = 250 } };
+    switch (event) {
+        .agent_end => |e| {
+            try std.testing.expectEqual(@as(u64, 1500), e.duration_ms);
+            try std.testing.expectEqual(@as(?u64, 250), e.tokens_used);
+        },
+        else => unreachable,
+    }
+}
+
+test "ObserverEvent err fields" {
+    const event = ObserverEvent{ .err = .{ .component = "gateway", .message = "connection refused" } };
+    switch (event) {
+        .err => |e| {
+            try std.testing.expectEqualStrings("gateway", e.component);
+            try std.testing.expectEqualStrings("connection refused", e.message);
+        },
+        else => unreachable,
+    }
+}
+
+test "ObserverEvent tool_call detail defaults to null" {
+    const event = ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 42, .success = true } };
+    switch (event) {
+        .tool_call => |e| {
+            try std.testing.expectEqualStrings("shell", e.tool);
+            try std.testing.expectEqual(@as(u64, 42), e.duration_ms);
+            try std.testing.expect(e.success);
+            try std.testing.expect(e.detail == null);
+        },
+        else => unreachable,
+    }
+}
+
+test "ObserverEvent tool_call detail carries failure context" {
+    const event = ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = false, .detail = "exit code 1" } };
+    switch (event) {
+        .tool_call => |e| {
+            try std.testing.expect(!e.success);
+            try std.testing.expectEqualStrings("exit code 1", e.detail.?);
+        },
+        else => unreachable,
+    }
+}
+
+test "ObserverMetric variants" {
+    const m1 = ObserverMetric{ .request_latency_ms = 100 };
+    const m2 = ObserverMetric{ .tokens_used = 50 };
+    const m3 = ObserverMetric{ .active_sessions = 3 };
+    const m4 = ObserverMetric{ .queue_depth = 10 };
+    switch (m1) {
+        .request_latency_ms => |v| try std.testing.expectEqual(@as(u64, 100), v),
+        else => unreachable,
+    }
+    switch (m2) {
+        .tokens_used => |v| try std.testing.expectEqual(@as(u64, 50), v),
+        else => unreachable,
+    }
+    switch (m3) {
+        .active_sessions => |v| try std.testing.expectEqual(@as(u64, 3), v),
+        else => unreachable,
+    }
+    switch (m4) {
+        .queue_depth => |v| try std.testing.expectEqual(@as(u64, 10), v),
+        else => unreachable,
+    }
+}
+
+test "LogObserver handles failed llm_response" {
+    var log_obs = LogObserver{};
+    const obs = log_obs.observer();
+    const event = ObserverEvent{ .llm_response = .{
+        .provider = "test",
+        .model = "test",
+        .duration_ms = 0,
+        .success = false,
+        .error_message = "timeout",
+    } };
+    obs.recordEvent(&event);
+    // No panic = success
+}
+
+test "NoopObserver all metrics no-op" {
+    var noop = NoopObserver{};
+    const obs = noop.observer();
+    const metrics = [_]ObserverMetric{
+        .{ .request_latency_ms = 0 },
+        .{ .tokens_used = std.math.maxInt(u64) },
+        .{ .active_sessions = 0 },
+        .{ .queue_depth = 0 },
+    };
+    for (&metrics) |*metric| {
+        obs.recordMetric(metric);
+    }
+}
+
+test "MultiObserver with single observer" {
+    var noop = NoopObserver{};
+    var observers_arr = [_]Observer{noop.observer()};
+    var multi = MultiObserver{ .observers = &observers_arr };
+    const obs = multi.observer();
+    try std.testing.expectEqualStrings("multi", obs.getName());
+    const event = ObserverEvent{ .turn_complete = {} };
+    obs.recordEvent(&event);
+}
+
+test "createObserver case sensitive" {
+    try std.testing.expectEqualStrings("noop", createObserver("Log"));
+    try std.testing.expectEqualStrings("noop", createObserver("VERBOSE"));
+    try std.testing.expectEqualStrings("noop", createObserver("NONE"));
+    try std.testing.expectEqualStrings("noop", createObserver("FILE"));
+}
+
+test "Observer interface dispatches correctly" {
+    // Verify the vtable pattern works through the Observer interface
+    var noop = NoopObserver{};
+    var log_obs = LogObserver{};
+    var verbose = VerboseObserver{};
+    var file_obs = FileObserver{ .path = "/tmp/nullclaw_dispatch_test.jsonl" };
+
+    const observers = [_]Observer{ noop.observer(), log_obs.observer(), verbose.observer(), file_obs.observer() };
+    const expected_names = [_][]const u8{ "noop", "log", "verbose", "file" };
+
+    for (observers, expected_names) |obs, name| {
+        try std.testing.expectEqualStrings(name, obs.getName());
+    }
+}
+
+// ── OtelObserver tests ──────────────────────────────────────────
+
+test "OtelObserver name" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+    try std.testing.expectEqualStrings("otel", obs.getName());
+}
+
+test "OtelObserver init defaults" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    try std.testing.expectEqualStrings("https://localhost:4318", otel.endpoint);
+    try std.testing.expectEqualStrings("nullclaw", otel.service_name);
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+}
+
+test "OtelObserver init custom endpoint" {
+    var otel = OtelObserver.init(std.testing.allocator, "https://otel.example.com:4318", "myservice");
+    defer otel.deinit();
+    try std.testing.expectEqualStrings("https://otel.example.com:4318", otel.endpoint);
+    try std.testing.expectEqualStrings("myservice", otel.service_name);
+}
+
+test "OtelObserver initWithHeaders builds curl headers" {
+    const headers = [_]OtelObserver.HeaderEntry{
+        .{ .key = "Authorization", .value = "Bearer secret" },
+        .{ .key = "x-nullwatch-source", .value = "nullclaw" },
+    };
+    var otel = try OtelObserver.initWithHeaders(std.testing.allocator, null, null, &headers);
+    defer otel.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), otel.headers.len);
+    try std.testing.expectEqualStrings("Authorization: Bearer secret", otel.headers[0]);
+    try std.testing.expectEqualStrings("x-nullwatch-source: nullclaw", otel.headers[1]);
+}
+
+test "OtelObserver initWithHeaders rejects remote http endpoint" {
+    try std.testing.expectError(
+        error.InvalidOtelEndpoint,
+        OtelObserver.initWithHeaders(std.testing.allocator, "http://otel.example.com:4318", null, &.{}),
+    );
+}
+
+test "OtelObserver initWithHeaders rejects malformed header" {
+    const headers = [_]OtelObserver.HeaderEntry{
+        .{ .key = "Authorization", .value = "Bearer test\r\nX-Injected: yes" },
+    };
+    try std.testing.expectError(
+        error.InvalidOtelHeader,
+        OtelObserver.initWithHeaders(std.testing.allocator, null, null, &headers),
+    );
+}
+
+test "RuntimeObserver combines configured backend with extra observers" {
+    var extra = NoopObserver{};
+    const headers = [_]OtelObserver.HeaderEntry{
+        .{ .key = "Authorization", .value = "Bearer secret" },
+    };
+    const runtime_observer = try RuntimeObserver.create(
+        std.testing.allocator,
+        .{
+            .workspace_dir = "/tmp",
+            .backend = "otel",
+            .otel_service_name = "nullclaw",
+        },
+        &headers,
+        &.{extra.observer()},
+    );
+    defer runtime_observer.destroy();
+
+    try std.testing.expectEqualStrings("multi", runtime_observer.observer().getName());
+    try std.testing.expectEqualStrings("otel", runtime_observer.backendObserver().getName());
+    try std.testing.expect(runtime_observer.otel != null);
+    try std.testing.expectEqual(@as(usize, 1), runtime_observer.otel.?.headers.len);
+    try std.testing.expectEqualStrings("Authorization: Bearer secret", runtime_observer.otel.?.headers[0]);
+    try std.testing.expectEqual(@as(usize, 2), runtime_observer.multi_observers.len);
+}
+
+test "OtelObserver span building on agent_start" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .agent_start = .{ .provider = "openrouter", .model = "claude" } };
+    obs.recordEvent(&event);
+
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+    try std.testing.expectEqualStrings("agent.start", otel.spans.items[0].name);
+    // trace_id should be set (not all zeros)
+    var all_zero = true;
+    for (otel.spans.items[0].trace_id) |b| {
+        if (b != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    try std.testing.expect(!all_zero);
+}
+
+test "OtelObserver resets trace after turn_complete" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const first = ObserverEvent{ .llm_request = .{ .provider = "a", .model = "m", .messages_count = 1 } };
+    const complete = ObserverEvent{ .turn_complete = {} };
+    const second = ObserverEvent{ .llm_request = .{ .provider = "b", .model = "m", .messages_count = 1 } };
+
+    obs.recordEvent(&first);
+    const first_trace_id = otel.spans.items[0].trace_id;
+    obs.recordEvent(&complete);
+    obs.recordEvent(&second);
+
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+    try std.testing.expect(!std.mem.eql(u8, &first_trace_id, &otel.spans.items[0].trace_id));
+}
+
+test "OtelObserver isolates trace context per thread" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+
+    const Worker = struct {
+        fn run(observer: *OtelObserver, provider: []const u8) void {
+            const obs = observer.observer();
+            const request = ObserverEvent{ .llm_request = .{
+                .provider = provider,
+                .model = "m",
+                .messages_count = 1,
+            } };
+            const tick = ObserverEvent{ .heartbeat_tick = {} };
+            obs.recordEvent(&request);
+            obs.recordEvent(&tick);
+        }
+    };
+
+    const thread_a = try std.Thread.spawn(.{}, Worker.run, .{ &otel, "alpha" });
+    const thread_b = try std.Thread.spawn(.{}, Worker.run, .{ &otel, "beta" });
+    thread_a.join();
+    thread_b.join();
+
+    try std.testing.expectEqual(@as(usize, 4), otel.spans.items.len);
+    try std.testing.expect(!std.mem.eql(u8, &otel.spans.items[0].trace_id, &otel.spans.items[2].trace_id));
+}
+
+test "OtelObserver span building on all event types" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    // Keep this set below the batch threshold and avoid flush boundaries so
+    // each recorded event remains inspectable in the in-memory span buffer.
+    const events = [_]ObserverEvent{
+        .{ .agent_start = .{ .provider = "test", .model = "test" } },
+        .{ .llm_request = .{ .provider = "test", .model = "test", .messages_count = 1 } },
+        .{ .llm_response = .{ .provider = "test", .model = "test", .duration_ms = 100, .success = true, .error_message = null } },
+        .{ .tool_call_start = .{ .tool = "shell" } },
+        .{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } },
+        .{ .channel_message = .{ .channel = "cli", .direction = "inbound" } },
+        .{ .heartbeat_tick = {} },
+        .{ .err = .{ .component = "test", .message = "oops" } },
+    };
+    for (&events) |*event| {
+        obs.recordEvent(event);
+    }
+
+    try std.testing.expectEqual(@as(usize, 8), otel.spans.items.len);
+    try std.testing.expectEqualStrings("agent.start", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("llm.request", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("llm.response", otel.spans.items[2].name);
+    try std.testing.expectEqualStrings("tool.start", otel.spans.items[3].name);
+    try std.testing.expectEqualStrings("tool.call", otel.spans.items[4].name);
+    try std.testing.expectEqualStrings("channel.message", otel.spans.items[5].name);
+    try std.testing.expectEqualStrings("heartbeat.tick", otel.spans.items[6].name);
+    try std.testing.expectEqualStrings("error", otel.spans.items[7].name);
+}
+
+test "OtelObserver span attributes" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .agent_start = .{ .provider = "openrouter", .model = "claude" } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    try std.testing.expectEqual(@as(usize, 2), span.attributes.items.len);
+    try std.testing.expectEqualStrings("provider", span.attributes.items[0].key);
+    try std.testing.expectEqualStrings("openrouter", span.attributes.items[0].value);
+    try std.testing.expectEqualStrings("model", span.attributes.items[1].key);
+    try std.testing.expectEqualStrings("claude", span.attributes.items[1].value);
+}
+
+test "OtelObserver subagent and cron spans include task attribution" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const subagent = ObserverEvent{ .subagent_start = .{
+        .agent_name = "delegate",
+        .task = "inspect scheduler telemetry",
+    } };
+    const cron = ObserverEvent{ .cron_job_start = .{
+        .task = "send daily digest",
+        .channel = "telegram",
+        .bot_account = "bot-main",
+    } };
+    obs.recordEvent(&subagent);
+    obs.recordEvent(&cron);
+
+    try std.testing.expectEqual(@as(usize, 2), otel.spans.items.len);
+    try std.testing.expectEqualStrings("subagent.start", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("task", otel.spans.items[0].attributes.items[1].key);
+    try std.testing.expectEqualStrings("inspect scheduler telemetry", otel.spans.items[0].attributes.items[1].value);
+    try std.testing.expectEqualStrings("cron.job.start", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("task", otel.spans.items[1].attributes.items[0].key);
+    try std.testing.expectEqualStrings("send daily digest", otel.spans.items[1].attributes.items[0].value);
+    try std.testing.expectEqualStrings("channel", otel.spans.items[1].attributes.items[1].key);
+    try std.testing.expectEqualStrings("telegram", otel.spans.items[1].attributes.items[1].value);
+    try std.testing.expectEqualStrings("bot_account", otel.spans.items[1].attributes.items[2].key);
+    try std.testing.expectEqualStrings("bot-main", otel.spans.items[1].attributes.items[2].value);
+}
+
+test "OtelObserver spans build on observability extension event types" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const events = [_]ObserverEvent{
+        .{ .subagent_start = .{ .agent_name = "worker", .task = "review diff" } },
+        .{ .cron_job_start = .{ .task = "nightly report", .channel = "telegram", .bot_account = "bot-a" } },
+        .{ .skill_load = .{ .name = "reviewer", .duration_ms = 12 } },
+    };
+    for (&events) |*event| {
+        obs.recordEvent(event);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), otel.spans.items.len);
+    try std.testing.expectEqualStrings("subagent.start", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("cron.job.start", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("skill.load", otel.spans.items[2].name);
+}
+
+test "OtelObserver tool_call includes detail attribute" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 12,
+        .success = false,
+        .detail = "permission denied",
+    } };
+    obs.recordEvent(&event);
+
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+    const span = otel.spans.items[0];
+    try std.testing.expectEqualStrings("tool.call", span.name);
+
+    var found_detail = false;
+    for (span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "detail")) {
+            found_detail = true;
+            try std.testing.expectEqualStrings("permission denied", attr.value);
+        }
+    }
+    try std.testing.expect(found_detail);
+}
+
+test "OtelObserver llm_request includes detail attribute" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .llm_request = .{
+        .provider = "openrouter",
+        .model = "claude",
+        .messages_count = 2,
+        .detail = "#1 role=user content=\"hello\"",
+    } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    var found_messages_count = false;
+    var found_detail = false;
+    for (span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "messages_count")) {
+            found_messages_count = true;
+            try std.testing.expectEqualStrings("2", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "detail")) {
+            found_detail = true;
+            try std.testing.expectEqualStrings("#1 role=user content=\"hello\"", attr.value);
+        }
+    }
+    try std.testing.expect(found_messages_count);
+    try std.testing.expect(found_detail);
+}
+
+test "OtelObserver llm_response includes usage and detail attributes" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .llm_response = .{
+        .provider = "openrouter",
+        .model = "claude",
+        .duration_ms = 150,
+        .success = true,
+        .error_message = null,
+        .prompt_tokens = 11,
+        .completion_tokens = 7,
+        .total_tokens = 18,
+        .detail = "content=\"hello back\"",
+    } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    var found_prompt = false;
+    var found_completion = false;
+    var found_total = false;
+    var found_detail = false;
+    for (span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "prompt_tokens")) {
+            found_prompt = true;
+            try std.testing.expectEqualStrings("11", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "completion_tokens")) {
+            found_completion = true;
+            try std.testing.expectEqualStrings("7", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "total_tokens")) {
+            found_total = true;
+            try std.testing.expectEqualStrings("18", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "detail")) {
+            found_detail = true;
+            try std.testing.expectEqualStrings("content=\"hello back\"", attr.value);
+        }
+    }
+    try std.testing.expect(found_prompt);
+    try std.testing.expect(found_completion);
+    try std.testing.expect(found_total);
+    try std.testing.expect(found_detail);
+}
+
+test "OtelObserver tool_call includes args attribute" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 12,
+        .success = true,
+        .args = "{\"command\":\"pwd\"}",
+        .detail = "\"/tmp\"",
+    } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    var found_args = false;
+    var found_detail = false;
+    for (span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "args")) {
+            found_args = true;
+            try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", attr.value);
+        }
+        if (std.mem.eql(u8, attr.key, "detail")) {
+            found_detail = true;
+            try std.testing.expectEqualStrings("\"/tmp\"", attr.value);
+        }
+    }
+    try std.testing.expect(found_args);
+    try std.testing.expect(found_detail);
+}
+
+test "OtelObserver spans keep independent attribute values" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const first = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 111,
+        .success = false,
+        .detail = "first detail",
+    } };
+    const second = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 222,
+        .success = false,
+        .detail = "second detail",
+    } };
+    obs.recordEvent(&first);
+    obs.recordEvent(&second);
+
+    try std.testing.expectEqual(@as(usize, 2), otel.spans.items.len);
+
+    const first_span = otel.spans.items[0];
+    const second_span = otel.spans.items[1];
+
+    var first_duration: ?[]const u8 = null;
+    var second_duration: ?[]const u8 = null;
+    var first_detail: ?[]const u8 = null;
+    var second_detail: ?[]const u8 = null;
+
+    for (first_span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "duration_ms")) first_duration = attr.value;
+        if (std.mem.eql(u8, attr.key, "detail")) first_detail = attr.value;
+    }
+    for (second_span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "duration_ms")) second_duration = attr.value;
+        if (std.mem.eql(u8, attr.key, "detail")) second_detail = attr.value;
+    }
+
+    try std.testing.expect(first_duration != null);
+    try std.testing.expect(second_duration != null);
+    try std.testing.expect(first_detail != null);
+    try std.testing.expect(second_detail != null);
+    try std.testing.expectEqualStrings("111", first_duration.?);
+    try std.testing.expectEqualStrings("222", second_duration.?);
+    try std.testing.expectEqualStrings("first detail", first_detail.?);
+    try std.testing.expectEqualStrings("second detail", second_detail.?);
+}
+
+test "OtelObserver JSON serialization escapes tool_call detail" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const start = ObserverEvent{ .agent_start = .{ .provider = "openrouter", .model = "claude" } };
+    const event = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 5,
+        .success = false,
+        .detail = "exit code 1: \"denied\"\nline2",
+    } };
+    obs.recordEvent(&start);
+    obs.recordEvent(&event);
+
+    const json = try otel.serializeSpans();
+    defer std.testing.allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\\"denied\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\nline2") != null);
+}
+
+test "OtelObserver JSON serialization" {
+    var otel = OtelObserver.init(std.testing.allocator, null, "test-svc");
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .agent_start = .{ .provider = "test", .model = "m1" } };
+    obs.recordEvent(&event);
+
+    const json = try otel.serializeSpans();
+    defer std.testing.allocator.free(json);
+
+    // Verify overall structure
+    try std.testing.expect(std.mem.startsWith(u8, json, "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"test-svc\"}}]}"));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent.start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"traceId\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"spanId\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"startTimeUnixNano\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"endTimeUnixNano\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"key\":\"provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stringValue\":\"test\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, json, "]}]}]}"));
+}
+
+test "OtelObserver JSON multiple spans" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const e1 = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
+    otel.observer().recordEvent(&e1);
+    const e2 = ObserverEvent{ .heartbeat_tick = {} };
+    otel.observer().recordEvent(&e2);
+
+    const json = try otel.serializeSpans();
+    defer std.testing.allocator.free(json);
+
+    // Two spans separated by comma
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"agent.start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"heartbeat.tick\"") != null);
+}
+
+test "OtelObserver flushes buffered spans on turn complete" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const start = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
+    obs.recordEvent(&start);
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+
+    const complete = ObserverEvent{ .turn_complete = {} };
+    obs.recordEvent(&complete);
+
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+}
+
+test "OtelObserver flushes buffered spans on agent end" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const start = ObserverEvent{ .agent_start = .{ .provider = "a", .model = "b" } };
+    obs.recordEvent(&start);
+    try std.testing.expectEqual(@as(usize, 1), otel.spans.items.len);
+
+    const end = ObserverEvent{ .agent_end = .{ .duration_ms = 12, .tokens_used = 3 } };
+    obs.recordEvent(&end);
+
+    try std.testing.expectEqual(@as(usize, 0), otel.spans.items.len);
+}
+
+test "OtelObserver batch flush at 10 spans" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    // Record 9 events — should not flush
+    for (0..9) |_| {
+        const event = ObserverEvent{ .heartbeat_tick = {} };
+        obs.recordEvent(&event);
+    }
+    try std.testing.expectEqual(@as(usize, 9), otel.spans.items.len);
+
+    // 10th event triggers flush attempt (curl fails, spans get cleared anyway)
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    // After flush attempt (curl fails), spans are cleared
+    try std.testing.expect(otel.spans.items.len < 10);
+}
+
+test "OtelObserver metrics create spans" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const m1 = ObserverMetric{ .request_latency_ms = 42 };
+    obs.recordMetric(&m1);
+    const m2 = ObserverMetric{ .tokens_used = 100 };
+    obs.recordMetric(&m2);
+    const m3 = ObserverMetric{ .active_sessions = 3 };
+    obs.recordMetric(&m3);
+    const m4 = ObserverMetric{ .queue_depth = 7 };
+    obs.recordMetric(&m4);
+
+    try std.testing.expectEqual(@as(usize, 4), otel.spans.items.len);
+    try std.testing.expectEqualStrings("metric.request_latency_ms", otel.spans.items[0].name);
+    try std.testing.expectEqualStrings("metric.tokens_used", otel.spans.items[1].name);
+    try std.testing.expectEqualStrings("metric.active_sessions", otel.spans.items[2].name);
+    try std.testing.expectEqualStrings("metric.queue_depth", otel.spans.items[3].name);
+}
+
+test "OtelObserver flush empty is noop" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+    // Flush with no spans should not panic or leak
+    obs.flush();
+}
+
+test "OtelObserver randomHex produces valid hex" {
+    var buf: [32]u8 = undefined;
+    OtelObserver.randomHex(&buf);
+    for (buf) |c| {
+        try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+    }
+}
+
+test "OtelObserver span timing" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    try std.testing.expect(span.start_ns > 0);
+    try std.testing.expect(span.end_ns >= span.start_ns);
+}
+
+test "OtelObserver llm_response has duration-adjusted start" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .llm_response = .{
+        .provider = "p",
+        .model = "m",
+        .duration_ms = 100,
+        .success = true,
+        .error_message = null,
+    } };
+    obs.recordEvent(&event);
+
+    const span = otel.spans.items[0];
+    // start should be earlier than end by ~100ms
+    try std.testing.expect(span.end_ns >= span.start_ns);
+    try std.testing.expect(span.end_ns - span.start_ns >= 50_000_000); // at least 50ms delta
+}
+
+test "OtelObserver vtable through Observer interface" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    // Verify it works through the generic Observer interface
+    try std.testing.expectEqualStrings("otel", obs.getName());
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+    const metric = ObserverMetric{ .tokens_used = 10 };
+    obs.recordMetric(&metric);
+    obs.flush(); // flush attempt (curl fails silently)
+}
+
+test "OtelObserver requests_total counter" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    try std.testing.expectEqual(@as(u64, 0), otel.requests_total.load(.monotonic));
+
+    const e1 = ObserverEvent{ .llm_request = .{ .provider = "p", .model = "m", .messages_count = 1 } };
+    obs.recordEvent(&e1);
+    try std.testing.expectEqual(@as(u64, 1), otel.requests_total.load(.monotonic));
+
+    obs.recordEvent(&e1);
+    obs.recordEvent(&e1);
+    try std.testing.expectEqual(@as(u64, 3), otel.requests_total.load(.monotonic));
+
+    // Non-request events should not increment requests_total
+    const e2 = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&e2);
+    try std.testing.expectEqual(@as(u64, 3), otel.requests_total.load(.monotonic));
+}
+
+test "OtelObserver errors_total counter on failed response" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    try std.testing.expectEqual(@as(u64, 0), otel.errors_total.load(.monotonic));
+
+    // Successful response should not increment errors
+    const ok = ObserverEvent{ .llm_response = .{ .provider = "p", .model = "m", .duration_ms = 50, .success = true, .error_message = null } };
+    obs.recordEvent(&ok);
+    try std.testing.expectEqual(@as(u64, 0), otel.errors_total.load(.monotonic));
+
+    // Failed response should increment errors
+    const fail = ObserverEvent{ .llm_response = .{ .provider = "p", .model = "m", .duration_ms = 50, .success = false, .error_message = "timeout" } };
+    obs.recordEvent(&fail);
+    try std.testing.expectEqual(@as(u64, 1), otel.errors_total.load(.monotonic));
+}
+
+test "OtelObserver errors_total counter on error event" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const e1 = ObserverEvent{ .err = .{ .component = "provider", .message = "connection refused" } };
+    obs.recordEvent(&e1);
+    obs.recordEvent(&e1);
+    try std.testing.expectEqual(@as(u64, 2), otel.errors_total.load(.monotonic));
+}
+
+test "OtelObserver JSON includes status code" {
+    var otel = OtelObserver.init(std.testing.allocator, null, "svc");
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const event = ObserverEvent{ .heartbeat_tick = {} };
+    obs.recordEvent(&event);
+
+    const json = try otel.serializeSpans();
+    defer std.testing.allocator.free(json);
+
+    // Each span should have status code 1 (OK)
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":{\"code\":1}") != null);
+}
+
+test "OtelObserver counters combined scenario" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    // 3 requests, 1 failed response, 2 errors
+    const req = ObserverEvent{ .llm_request = .{ .provider = "p", .model = "m", .messages_count = 1 } };
+    obs.recordEvent(&req);
+    obs.recordEvent(&req);
+    obs.recordEvent(&req);
+
+    const fail = ObserverEvent{ .llm_response = .{ .provider = "p", .model = "m", .duration_ms = 10, .success = false, .error_message = "err" } };
+    obs.recordEvent(&fail);
+
+    const err_evt = ObserverEvent{ .err = .{ .component = "net", .message = "dns" } };
+    obs.recordEvent(&err_evt);
+    obs.recordEvent(&err_evt);
+
+    try std.testing.expectEqual(@as(u64, 3), otel.requests_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 3), otel.errors_total.load(.monotonic)); // 1 failed response + 2 error events
+}

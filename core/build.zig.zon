@@ -1,0 +1,20 @@
+.{
+    .name = .nullclaw,
+    .version = "2026.5.29",
+    .fingerprint = 0xe73e13d1c95956c2,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .sqlite3 = .{
+            .path = "vendor/sqlite3",
+        },
+        .websocket = .{ .path = "deps/websocket" },
+        .wasm3 = .{ .path = "deps/wasm3" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+        "LICENSE",
+    },
+}

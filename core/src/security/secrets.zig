@@ -1,0 +1,1024 @@
+const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("../fs_compat.zig");
+const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const log = std.log.scoped(.secrets);
+
+/// Length of the random encryption key in bytes (256-bit).
+pub const KEY_LEN: usize = 32;
+
+/// ChaCha20-Poly1305 nonce length in bytes.
+pub const NONCE_LEN: usize = 12;
+
+/// Tag length
+pub const TAG_LEN: usize = ChaCha20Poly1305.tag_length;
+const KEY_ROTATION_MAX_AGE_DAYS: i64 = 90;
+const NS_PER_DAY: i128 = std.time.ns_per_day;
+
+/// Encrypt data using ChaCha20-Poly1305 (Zig stdlib).
+pub fn encrypt(key: [32]u8, nonce: [12]u8, plaintext: []const u8, buf: []u8) ![]const u8 {
+    if (buf.len < plaintext.len + ChaCha20Poly1305.tag_length) return error.BufferTooSmall;
+    var tag: [ChaCha20Poly1305.tag_length]u8 = undefined;
+    ChaCha20Poly1305.encrypt(
+        buf[0..plaintext.len],
+        &tag,
+        plaintext,
+        "",
+        nonce,
+        key,
+    );
+    @memcpy(buf[plaintext.len..][0..ChaCha20Poly1305.tag_length], &tag);
+    return buf[0 .. plaintext.len + ChaCha20Poly1305.tag_length];
+}
+
+/// Decrypt data using ChaCha20-Poly1305.
+pub fn decrypt(key: [32]u8, nonce: [12]u8, ciphertext: []const u8, buf: []u8) ![]const u8 {
+    if (ciphertext.len < ChaCha20Poly1305.tag_length) return error.CiphertextTooShort;
+    const data_len = ciphertext.len - ChaCha20Poly1305.tag_length;
+    const tag: [ChaCha20Poly1305.tag_length]u8 = ciphertext[data_len..][0..ChaCha20Poly1305.tag_length].*;
+    ChaCha20Poly1305.decrypt(
+        buf[0..data_len],
+        ciphertext[0..data_len],
+        tag,
+        "",
+        nonce,
+        key,
+    ) catch return error.DecryptionFailed;
+    return buf[0..data_len];
+}
+
+/// HMAC-SHA256 for webhook signature verification.
+pub fn hmacSha256(key: []const u8, message: []const u8) [HmacSha256.mac_length]u8 {
+    var out: [HmacSha256.mac_length]u8 = undefined;
+    var h = HmacSha256.init(key);
+    h.update(message);
+    h.final(&out);
+    return out;
+}
+
+/// Hex-encode bytes to a lowercase hex string.
+pub fn hexEncode(data: []const u8, buf: []u8) []const u8 {
+    const charset = "0123456789abcdef";
+    const len = @min(data.len * 2, buf.len);
+    var i: usize = 0;
+    while (i < data.len and i * 2 + 1 < buf.len) : (i += 1) {
+        buf[i * 2] = charset[data[i] >> 4];
+        buf[i * 2 + 1] = charset[data[i] & 0x0f];
+    }
+    return buf[0..len];
+}
+
+/// Hex-decode a hex string to bytes.
+pub fn hexDecode(hex: []const u8, buf: []u8) ![]const u8 {
+    if (hex.len & 1 != 0) return error.OddHexLength;
+    const byte_len = hex.len / 2;
+    if (buf.len < byte_len) return error.BufferTooSmall;
+    for (0..byte_len) |i| {
+        const hi: u8 = hexVal(hex[i * 2]) orelse return error.InvalidHex;
+        const lo: u8 = hexVal(hex[i * 2 + 1]) orelse return error.InvalidHex;
+        buf[i] = (hi << 4) | lo;
+    }
+    return buf[0..byte_len];
+}
+
+fn hexVal(c: u8) ?u4 {
+    if (c >= '0' and c <= '9') return @intCast(c - '0');
+    if (c >= 'a' and c <= 'f') return @intCast(c - 'a' + 10);
+    if (c >= 'A' and c <= 'F') return @intCast(c - 'A' + 10);
+    return null;
+}
+
+/// Manages encrypted storage of secrets (API keys, tokens, etc.)
+/// Secrets are encrypted using ChaCha20-Poly1305 AEAD with a random key
+/// stored on disk with restrictive file permissions.
+pub const SecretStore = struct {
+    /// Path to the key file
+    key_path_buf: [std_compat.fs.max_path_bytes]u8 = undefined,
+    key_path_len: usize,
+    /// Whether encryption is enabled
+    enabled: bool,
+
+    /// Create a new secret store rooted at the given directory.
+    pub fn init(dir: []const u8, enabled: bool) SecretStore {
+        var store = SecretStore{
+            .key_path_len = 0,
+            .enabled = enabled,
+        };
+        const key_name = "/.secret_key";
+        const total = @min(dir.len + key_name.len, store.key_path_buf.len);
+        const dir_len = @min(dir.len, store.key_path_buf.len);
+        @memcpy(store.key_path_buf[0..dir_len], dir[0..dir_len]);
+        if (total > dir_len) {
+            const rest_len = total - dir_len;
+            @memcpy(store.key_path_buf[dir_len..][0..rest_len], key_name[0..rest_len]);
+        }
+        store.key_path_len = total;
+        return store;
+    }
+
+    fn keyPath(self: *const SecretStore) []const u8 {
+        return self.key_path_buf[0..self.key_path_len];
+    }
+
+    fn prevKeyPath(self: *const SecretStore, buf: *[std_compat.fs.max_path_bytes]u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}.prev", .{self.keyPath()});
+    }
+
+    fn archivedPrevKeyPath(
+        self: *const SecretStore,
+        buf: *[std_compat.fs.max_path_bytes]u8,
+        stamp_ns: i128,
+        suffix: usize,
+    ) ![]const u8 {
+        if (suffix == 0) {
+            return std.fmt.bufPrint(buf, "{s}.prev.{d}", .{ self.keyPath(), stamp_ns });
+        }
+        return std.fmt.bufPrint(buf, "{s}.prev.{d}.{d}", .{ self.keyPath(), stamp_ns, suffix });
+    }
+
+    fn archivePreviousKey(self: *const SecretStore) !void {
+        const stamp_ns: i128 = @as(i128, std_compat.time.nanoTimestamp());
+        var prev_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+        const prev_path = self.prevKeyPath(&prev_buf) catch return error.KeyRotateFailed;
+
+        var archived_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+        var suffix: usize = 0;
+        while (true) : (suffix += 1) {
+            const archived_path = self.archivedPrevKeyPath(&archived_buf, stamp_ns, suffix) catch {
+                return error.KeyRotateFailed;
+            };
+            fs_compat.renamePath(prev_path, archived_path) catch |err| switch (err) {
+                error.FileNotFound => return,
+                else => return error.KeyRotateFailed,
+            };
+            return;
+        }
+    }
+
+    pub fn rotateKey(self: *const SecretStore, allocator: std.mem.Allocator) !void {
+        _ = allocator;
+        const path = self.keyPath();
+        _ = self.loadKeyFromPath(path) catch return error.KeyRotateFailed;
+
+        try self.archivePreviousKey();
+        var prev_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+        const prev_path = self.prevKeyPath(&prev_buf) catch return error.KeyRotateFailed;
+        fs_compat.renamePath(path, prev_path) catch return error.KeyRotateFailed;
+
+        var new_key: [KEY_LEN]u8 = undefined;
+        std_compat.crypto.random.bytes(&new_key);
+        try self.writeKeyToPath(path, new_key);
+    }
+
+    /// Encrypt a plaintext secret. Returns hex-encoded ciphertext prefixed with "enc2:".
+    /// Format: enc2:<hex(nonce || ciphertext || tag)> (12 + N + 16 bytes).
+    /// If encryption is disabled, returns the plaintext as-is.
+    pub fn encryptSecret(self: *const SecretStore, allocator: std.mem.Allocator, plaintext: []const u8) ![]u8 {
+        if (!self.enabled or plaintext.len == 0) {
+            return try allocator.dupe(u8, plaintext);
+        }
+
+        const key = try self.loadOrCreateKey();
+
+        // Generate random nonce
+        var nonce: [NONCE_LEN]u8 = undefined;
+        std_compat.crypto.random.bytes(&nonce);
+
+        // Encrypt
+        const ct_len = plaintext.len + TAG_LEN;
+        var ct_buf = try allocator.alloc(u8, ct_len);
+        defer allocator.free(ct_buf);
+
+        var tag: [TAG_LEN]u8 = undefined;
+        ChaCha20Poly1305.encrypt(
+            ct_buf[0..plaintext.len],
+            &tag,
+            plaintext,
+            "",
+            nonce,
+            key,
+        );
+        @memcpy(ct_buf[plaintext.len..][0..TAG_LEN], &tag);
+
+        // Build blob: nonce || ciphertext || tag
+        const blob_len = NONCE_LEN + ct_len;
+        var blob = try allocator.alloc(u8, blob_len);
+        defer allocator.free(blob);
+        @memcpy(blob[0..NONCE_LEN], &nonce);
+        @memcpy(blob[NONCE_LEN..][0..ct_len], ct_buf);
+
+        // Hex encode and prepend "enc2:"
+        const hex_len = blob_len * 2;
+        const result = try allocator.alloc(u8, 5 + hex_len); // "enc2:" + hex
+        @memcpy(result[0..5], "enc2:");
+        _ = hexEncode(blob, result[5..]);
+
+        return result;
+    }
+
+    /// Decrypt a secret.
+    /// - "enc2:" prefix -> ChaCha20-Poly1305
+    /// - No prefix -> returned as-is (plaintext)
+    pub fn decryptSecret(self: *const SecretStore, allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+        if (value.len > 5 and std.mem.eql(u8, value[0..5], "enc2:")) {
+            return self.decryptChacha20(allocator, value[5..]);
+        }
+        return try allocator.dupe(u8, value);
+    }
+
+    fn decryptChacha20(self: *const SecretStore, allocator: std.mem.Allocator, hex_str: []const u8) ![]u8 {
+        // Decode hex
+        var decode_buf: [8192]u8 = undefined;
+        const blob = hexDecode(hex_str, &decode_buf) catch return error.CorruptHex;
+        if (blob.len <= NONCE_LEN) return error.CiphertextTooShort;
+
+        const nonce: [NONCE_LEN]u8 = blob[0..NONCE_LEN].*;
+        const ciphertext = blob[NONCE_LEN..];
+
+        const key = try self.loadOrCreateKey();
+
+        // Use the top-level decrypt with a stack buffer (avoids segfault
+        // in ChaCha20Poly1305.decrypt when tag verification fails with
+        // heap-allocated output on Zig 0.15/macOS).
+        var plain_buf: [8192]u8 = undefined;
+        const decrypted = decrypt(key, nonce, ciphertext, &plain_buf) catch blk: {
+            const prev = self.loadPreviousKey() catch null;
+            if (prev) |prev_key| {
+                const old_decrypted = decrypt(prev_key, nonce, ciphertext, &plain_buf) catch null;
+                if (old_decrypted) |plaintext| break :blk plaintext;
+            }
+
+            const archived = self.decryptWithArchivedKeys(nonce, ciphertext, &plain_buf) catch null;
+            if (archived) |plaintext| {
+                break :blk plaintext;
+            }
+            return error.DecryptionFailed;
+        };
+
+        return try allocator.dupe(u8, decrypted);
+    }
+
+    fn decryptWithArchivedKeys(
+        self: *const SecretStore,
+        nonce: [NONCE_LEN]u8,
+        ciphertext: []const u8,
+        plain_buf: []u8,
+    ) !?[]const u8 {
+        const key_path = self.keyPath();
+        const key_dir = std_compat.fs.path.dirname(key_path) orelse ".";
+        const key_name = std_compat.fs.path.basename(key_path);
+
+        var prefix_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&prefix_buf, "{s}.prev.", .{key_name}) catch return error.KeyReadFailed;
+
+        var dir = fs_compat.openDirPath(key_dir, .{ .iterate = true }) catch return error.KeyReadFailed;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+
+            const file = dir.openFile(entry.name, .{}) catch continue;
+            defer file.close();
+
+            const archived_key = self.readKeyFromFile(file) catch continue;
+            const decrypted = decrypt(archived_key, nonce, ciphertext, plain_buf) catch continue;
+            return decrypted;
+        }
+        return null;
+    }
+
+    fn loadPreviousKey(self: *const SecretStore) !?[KEY_LEN]u8 {
+        var prev_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+        const prev_path = self.prevKeyPath(&prev_buf) catch return error.KeyReadFailed;
+        const key = self.loadKeyFromPath(prev_path) catch |err| switch (err) {
+            error.KeyReadFailed => return null,
+            else => return err,
+        };
+        return key;
+    }
+
+    /// Check if a value is encrypted
+    pub fn isEncrypted(value: []const u8) bool {
+        return value.len >= 5 and std.mem.eql(u8, value[0..5], "enc2:");
+    }
+
+    /// Load the encryption key from disk, or create one if it doesn't exist.
+    fn loadOrCreateKey(self: *const SecretStore) ![KEY_LEN]u8 {
+        const path = self.keyPath();
+
+        // Try to read existing key
+        if (fs_compat.openPath(path, .{ .allow_directory = false, .follow_symlinks = false })) |file| {
+            defer file.close();
+            var key = try self.readKeyFromFile(file);
+
+            const stat = file.stat() catch return key;
+            if (shouldRotateByMtime(stat.mtime)) {
+                self.rotateKey(std.heap.page_allocator) catch |err| {
+                    log.warn("secret key rotation failed, continuing with existing key: {}", .{err});
+                    return key;
+                };
+                key = self.loadKeyFromPath(path) catch return error.KeyReadFailed;
+            }
+            return key;
+        } else |_| {
+            // Generate new key
+            var key: [KEY_LEN]u8 = undefined;
+            std_compat.crypto.random.bytes(&key);
+            self.writeKeyToPath(path, key) catch |err| switch (err) {
+                error.PathAlreadyExists => return self.loadKeyFromPath(path),
+                else => |e| return e,
+            };
+
+            return key;
+        }
+    }
+
+    fn shouldRotateByMtime(mtime_ns: i128) bool {
+        if (mtime_ns <= 0) return false;
+        const now_ns: i128 = @as(i128, std_compat.time.nanoTimestamp());
+        const age_ns = now_ns - mtime_ns;
+        return age_ns > (KEY_ROTATION_MAX_AGE_DAYS * NS_PER_DAY);
+    }
+
+    fn readKeyFromFile(self: *const SecretStore, file: std_compat.fs.File) ![KEY_LEN]u8 {
+        _ = self;
+        var hex_buf: [KEY_LEN * 2 + 16]u8 = undefined; // some slack for whitespace
+        // no-follow handles are asynchronous on Windows in Zig 0.16, so they
+        // must be read positionally rather than through readStreaming.
+        const bytes_read = file.readAllPositional(&hex_buf) catch return error.KeyReadFailed;
+        const hex_str = std.mem.trim(u8, hex_buf[0..bytes_read], " \t\r\n");
+        var key: [KEY_LEN]u8 = undefined;
+        const decoded = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
+        if (decoded.len != KEY_LEN) return error.KeyCorrupt;
+        return key;
+    }
+
+    fn loadKeyFromPath(self: *const SecretStore, path: []const u8) ![KEY_LEN]u8 {
+        _ = self;
+        const file = fs_compat.openPath(path, .{ .allow_directory = false, .follow_symlinks = false }) catch return error.KeyReadFailed;
+        defer file.close();
+        var hex_buf: [KEY_LEN * 2 + 16]u8 = undefined;
+        const bytes_read = file.readAllPositional(&hex_buf) catch return error.KeyReadFailed;
+        const hex_str = std.mem.trim(u8, hex_buf[0..bytes_read], " \t\r\n");
+        var key: [KEY_LEN]u8 = undefined;
+        const decoded = hexDecode(hex_str, &key) catch return error.KeyCorrupt;
+        if (decoded.len != KEY_LEN) return error.KeyCorrupt;
+        return key;
+    }
+
+    fn writeKeyToPath(self: *const SecretStore, path: []const u8, key: [KEY_LEN]u8) !void {
+        _ = self;
+        var hex_buf: [KEY_LEN * 2]u8 = undefined;
+        _ = hexEncode(&key, &hex_buf);
+
+        if (std_compat.fs.path.dirname(path)) |parent| {
+            fs_compat.makePath(parent) catch return error.KeyWriteFailed;
+        }
+
+        const result = fs_compat.writeFileAtomicSecureNoReplace(path, &hex_buf) catch return error.KeyWriteFailed;
+        if (result == .already_exists) return error.PathAlreadyExists;
+    }
+};
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+test "encrypt then decrypt roundtrip" {
+    const key = @as([32]u8, @splat(0x42));
+    const nonce = @as([12]u8, @splat(0x01));
+    const plaintext = "hello nullclaw";
+
+    var enc_buf: [256]u8 = undefined;
+    const encrypted = try encrypt(key, nonce, plaintext, &enc_buf);
+
+    var dec_buf: [256]u8 = undefined;
+    const decrypted = try decrypt(key, nonce, encrypted, &dec_buf);
+
+    try std.testing.expectEqualStrings(plaintext, decrypted);
+}
+
+test "hmac produces correct length" {
+    const result = hmacSha256("secret", "message");
+    try std.testing.expectEqual(@as(usize, 32), result.len);
+}
+
+test "hex encode decode roundtrip" {
+    const data = [_]u8{ 0x00, 0x01, 0xfe, 0xff, 0xab, 0xcd };
+    var enc_buf: [12]u8 = undefined;
+    const encoded = hexEncode(&data, &enc_buf);
+    try std.testing.expectEqualStrings("0001feffabcd", encoded);
+
+    var dec_buf: [6]u8 = undefined;
+    const decoded = try hexDecode(encoded, &dec_buf);
+    try std.testing.expectEqualSlices(u8, &data, decoded);
+}
+
+test "hex decode odd length fails" {
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.OddHexLength, hexDecode("abc", &buf));
+}
+
+test "hex decode invalid chars fails" {
+    var buf: [4]u8 = undefined;
+    try std.testing.expectError(error.InvalidHex, hexDecode("zzzz", &buf));
+}
+
+test "secret store encrypt decrypt roundtrip" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const secret = "sk-my-secret-api-key-12345";
+
+    const encrypted = try store.encryptSecret(std.testing.allocator, secret);
+    defer std.testing.allocator.free(encrypted);
+
+    try std.testing.expect(std.mem.startsWith(u8, encrypted, "enc2:"));
+    try std.testing.expect(!std.mem.eql(u8, encrypted, secret));
+
+    const decrypted = try store.decryptSecret(std.testing.allocator, encrypted);
+    defer std.testing.allocator.free(decrypted);
+
+    try std.testing.expectEqualStrings(secret, decrypted);
+}
+
+test "secret store encrypt empty returns empty" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const result = try store.encryptSecret(std.testing.allocator, "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "secret store decrypt plaintext passthrough" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const result = try store.decryptSecret(std.testing.allocator, "sk-plaintext-key");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("sk-plaintext-key", result);
+}
+
+test "secret store disabled returns plaintext" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, false);
+    const result = try store.encryptSecret(std.testing.allocator, "sk-secret");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("sk-secret", result);
+}
+
+test "secret store is encrypted detects prefix" {
+    try std.testing.expect(SecretStore.isEncrypted("enc2:aabbcc"));
+    try std.testing.expect(!SecretStore.isEncrypted("sk-plaintext"));
+    try std.testing.expect(!SecretStore.isEncrypted(""));
+}
+
+test "secret store encrypting same value produces different ciphertext" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const e1 = try store.encryptSecret(std.testing.allocator, "secret");
+    defer std.testing.allocator.free(e1);
+    const e2 = try store.encryptSecret(std.testing.allocator, "secret");
+    defer std.testing.allocator.free(e2);
+
+    try std.testing.expect(!std.mem.eql(u8, e1, e2));
+
+    // Both should decrypt to same value
+    const d1 = try store.decryptSecret(std.testing.allocator, e1);
+    defer std.testing.allocator.free(d1);
+    const d2 = try store.decryptSecret(std.testing.allocator, e2);
+    defer std.testing.allocator.free(d2);
+    try std.testing.expectEqualStrings("secret", d1);
+    try std.testing.expectEqualStrings("secret", d2);
+}
+
+test "secret store different dirs cannot decrypt each other" {
+    var tmp1 = std.testing.tmpDir(.{});
+    defer tmp1.cleanup();
+    const path1 = try @import("compat").fs.Dir.wrap(tmp1.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path1);
+
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    const path2 = try @import("compat").fs.Dir.wrap(tmp2.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path2);
+
+    const store1 = SecretStore.init(path1, true);
+    const store2 = SecretStore.init(path2, true);
+
+    const encrypted = try store1.encryptSecret(std.testing.allocator, "secret-for-store1");
+    defer std.testing.allocator.free(encrypted);
+
+    const result = store2.decryptSecret(std.testing.allocator, encrypted);
+    try std.testing.expectError(error.DecryptionFailed, result);
+}
+
+test "secret store same dir interop" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store1 = SecretStore.init(tmp_path, true);
+    const store2 = SecretStore.init(tmp_path, true);
+
+    const encrypted = try store1.encryptSecret(std.testing.allocator, "cross-store-secret");
+    defer std.testing.allocator.free(encrypted);
+
+    const decrypted = try store2.decryptSecret(std.testing.allocator, encrypted);
+    defer std.testing.allocator.free(decrypted);
+    try std.testing.expectEqualStrings("cross-store-secret", decrypted);
+}
+
+test "secret store concurrent first use publishes one complete key" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const WorkerResult = struct {
+        encrypted: ?[]u8 = null,
+        err: ?anyerror = null,
+    };
+    const Worker = struct {
+        fn run(
+            secret_store: *const SecretStore,
+            ready: *std.atomic.Value(u32),
+            go: *std.atomic.Value(bool),
+            plaintext: []const u8,
+            result: *WorkerResult,
+        ) void {
+            _ = ready.fetchAdd(1, .release);
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            result.encrypted = secret_store.encryptSecret(std.heap.page_allocator, plaintext) catch |err| {
+                result.err = err;
+                return;
+            };
+        }
+    };
+
+    var ready = std.atomic.Value(u32).init(0);
+    var go = std.atomic.Value(bool).init(false);
+    var results: [2]WorkerResult = .{ .{}, .{} };
+    const first = try std.Thread.spawn(.{}, Worker.run, .{
+        &store,
+        &ready,
+        &go,
+        "worker-a",
+        &results[0],
+    });
+    var second: ?std.Thread = null;
+    var threads_joined = false;
+    errdefer if (!threads_joined) {
+        go.store(true, .release);
+        if (second) |thread| thread.join();
+        first.join();
+        for (results) |result| {
+            if (result.encrypted) |encrypted| std.heap.page_allocator.free(encrypted);
+        }
+    };
+    second = try std.Thread.spawn(.{}, Worker.run, .{
+        &store,
+        &ready,
+        &go,
+        "worker-b",
+        &results[1],
+    });
+    while (ready.load(.acquire) != @as(u32, @intCast(results.len))) std.atomic.spinLoopHint();
+    go.store(true, .release);
+    first.join();
+    second.?.join();
+    threads_joined = true;
+    defer {
+        for (results) |result| {
+            if (result.encrypted) |encrypted| std.heap.page_allocator.free(encrypted);
+        }
+    }
+
+    try std.testing.expect(results[0].err == null);
+    try std.testing.expect(results[1].err == null);
+    const encrypted_a = results[0].encrypted orelse return error.TestUnexpectedResult;
+    const encrypted_b = results[1].encrypted orelse return error.TestUnexpectedResult;
+
+    const installed_store = SecretStore.init(tmp_path, true);
+    const decrypted_a = try installed_store.decryptSecret(std.testing.allocator, encrypted_a);
+    defer std.testing.allocator.free(decrypted_a);
+    try std.testing.expectEqualStrings("worker-a", decrypted_a);
+    const decrypted_b = try installed_store.decryptSecret(std.testing.allocator, encrypted_b);
+    defer std.testing.allocator.free(decrypted_b);
+    try std.testing.expectEqualStrings("worker-b", decrypted_b);
+
+    const key_file = try fs_compat.openPath(installed_store.keyPath(), .{});
+    defer key_file.close();
+    var key_buf: [KEY_LEN * 2 + 1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, KEY_LEN * 2), try key_file.readAll(&key_buf));
+}
+
+test "secret store decrypts data encrypted before key rotation" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+
+    const old_encrypted = try store.encryptSecret(std.testing.allocator, "old-secret");
+    defer std.testing.allocator.free(old_encrypted);
+
+    try store.rotateKey(std.testing.allocator);
+
+    const new_encrypted = try store.encryptSecret(std.testing.allocator, "new-secret");
+    defer std.testing.allocator.free(new_encrypted);
+
+    const old_decrypted = try store.decryptSecret(std.testing.allocator, old_encrypted);
+    defer std.testing.allocator.free(old_decrypted);
+    try std.testing.expectEqualStrings("old-secret", old_decrypted);
+
+    const new_decrypted = try store.decryptSecret(std.testing.allocator, new_encrypted);
+    defer std.testing.allocator.free(new_decrypted);
+    try std.testing.expectEqualStrings("new-secret", new_decrypted);
+}
+
+test "secret store preserves decryptability across multiple key rotations" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+
+    const oldest_encrypted = try store.encryptSecret(std.testing.allocator, "oldest-secret");
+    defer std.testing.allocator.free(oldest_encrypted);
+
+    try store.rotateKey(std.testing.allocator);
+
+    const middle_encrypted = try store.encryptSecret(std.testing.allocator, "middle-secret");
+    defer std.testing.allocator.free(middle_encrypted);
+
+    try store.rotateKey(std.testing.allocator);
+
+    const newest_encrypted = try store.encryptSecret(std.testing.allocator, "newest-secret");
+    defer std.testing.allocator.free(newest_encrypted);
+
+    const oldest_decrypted = try store.decryptSecret(std.testing.allocator, oldest_encrypted);
+    defer std.testing.allocator.free(oldest_decrypted);
+    try std.testing.expectEqualStrings("oldest-secret", oldest_decrypted);
+
+    const middle_decrypted = try store.decryptSecret(std.testing.allocator, middle_encrypted);
+    defer std.testing.allocator.free(middle_decrypted);
+    try std.testing.expectEqualStrings("middle-secret", middle_decrypted);
+
+    const newest_decrypted = try store.decryptSecret(std.testing.allocator, newest_encrypted);
+    defer std.testing.allocator.free(newest_decrypted);
+    try std.testing.expectEqualStrings("newest-secret", newest_decrypted);
+}
+
+// ── Additional encryption tests ──────────────────────────────────
+
+test "secret store unicode roundtrip" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const secret = "sk-\xc3\xa9mojis-\xf0\x9f\xa6\x80-test";
+
+    const encrypted = try store.encryptSecret(std.testing.allocator, secret);
+    defer std.testing.allocator.free(encrypted);
+
+    const decrypted = try store.decryptSecret(std.testing.allocator, encrypted);
+    defer std.testing.allocator.free(decrypted);
+    try std.testing.expectEqualStrings(secret, decrypted);
+}
+
+test "secret store key file created on first encrypt" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+
+    const encrypted = try store.encryptSecret(std.testing.allocator, "trigger-key-creation");
+    defer std.testing.allocator.free(encrypted);
+
+    // Key file should exist now
+    const key_path = store.keyPath();
+    const file = try fs_compat.openPath(key_path, .{});
+    defer file.close();
+    var buf: [128]u8 = undefined;
+    const bytes_read = try file.readAll(&buf);
+    // Key is hex-encoded 32 bytes = 64 hex chars
+    try std.testing.expectEqual(@as(usize, KEY_LEN * 2), bytes_read);
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        const metadata = try file.stat();
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o600), metadata.mode & 0o777);
+    }
+}
+
+test "secret store refuses symlink key path" {
+    if (@import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const victim = @as([(KEY_LEN * 2)]u8, @splat('0'));
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "victim-key", .data = &victim });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).symLink("victim-key", ".secret_key", .{});
+
+    const store = SecretStore.init(tmp_path, true);
+    try std.testing.expectError(
+        error.KeyReadFailed,
+        store.encryptSecret(std.testing.allocator, "must-not-follow"),
+    );
+
+    const unchanged = try fs_compat.readFileAlloc(tmp_dir.dir, std.testing.allocator, "victim-key", 128);
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expectEqualStrings(&victim, unchanged);
+}
+
+test "secret store rejects truncated even-length key" {
+    // Regression: hexDecode accepts shorter even-length input, so key readers
+    // must reject it instead of using an uninitialized key suffix.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+    const truncated_key = @as([(KEY_LEN * 2 - 2)]u8, @splat('0'));
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
+        .sub_path = ".secret_key",
+        .data = &truncated_key,
+    });
+
+    const store = SecretStore.init(tmp_path, true);
+    try std.testing.expectError(
+        error.KeyCorrupt,
+        store.encryptSecret(std.testing.allocator, "must-not-encrypt"),
+    );
+}
+
+test "secret store tampered ciphertext detected" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    const encrypted = try store.encryptSecret(std.testing.allocator, "sensitive-data");
+    defer std.testing.allocator.free(encrypted);
+
+    // Flip a byte in the hex ciphertext (after "enc2:" prefix)
+    // We need to decode hex, tamper, then re-encode
+    const hex_str = encrypted[5..];
+    var decode_buf: [8192]u8 = undefined;
+    const blob = try hexDecode(hex_str, &decode_buf);
+
+    // Tamper with a byte after the nonce
+    var tampered_blob: [8192]u8 = undefined;
+    @memcpy(tampered_blob[0..blob.len], blob);
+    if (blob.len > NONCE_LEN) {
+        tampered_blob[NONCE_LEN] ^= 0xff;
+    }
+
+    // Re-encode to hex
+    var hex_out: [16384]u8 = undefined;
+    const tampered_hex = hexEncode(tampered_blob[0..blob.len], &hex_out);
+
+    // Build tampered string: "enc2:" + tampered_hex
+    var tampered_full: [16400]u8 = undefined;
+    @memcpy(tampered_full[0..5], "enc2:");
+    @memcpy(tampered_full[5..][0..tampered_hex.len], tampered_hex);
+    const tampered_str = tampered_full[0 .. 5 + tampered_hex.len];
+
+    const result = store.decryptSecret(std.testing.allocator, tampered_str);
+    try std.testing.expectError(error.DecryptionFailed, result);
+}
+
+test "secret store truncated ciphertext returns error" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    // Trigger key creation first
+    const setup = try store.encryptSecret(std.testing.allocator, "setup");
+    defer std.testing.allocator.free(setup);
+
+    // Only a few bytes — shorter than nonce
+    const result = store.decryptSecret(std.testing.allocator, "enc2:aabbccdd");
+    try std.testing.expectError(error.CiphertextTooShort, result);
+}
+
+test "secret store corrupt hex returns error" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+    // Trigger key creation
+    const setup = try store.encryptSecret(std.testing.allocator, "setup");
+    defer std.testing.allocator.free(setup);
+
+    const result = store.decryptSecret(std.testing.allocator, "enc2:not-valid-hex!!");
+    try std.testing.expectError(error.CorruptHex, result);
+}
+
+test "encrypt with different nonce produces different output" {
+    const key = @as([32]u8, @splat(0x42));
+    const nonce1 = @as([12]u8, @splat(0x01));
+    const nonce2 = @as([12]u8, @splat(0x02));
+    const plaintext = "same input";
+
+    var enc1_buf: [256]u8 = undefined;
+    const e1 = try encrypt(key, nonce1, plaintext, &enc1_buf);
+
+    var enc2_buf: [256]u8 = undefined;
+    const e2 = try encrypt(key, nonce2, plaintext, &enc2_buf);
+
+    // Different nonces -> different ciphertext
+    try std.testing.expect(!std.mem.eql(u8, e1, e2));
+
+    // Both decrypt to same value
+    var dec1_buf: [256]u8 = undefined;
+    const d1 = try decrypt(key, nonce1, e1, &dec1_buf);
+    try std.testing.expectEqualStrings(plaintext, d1);
+
+    var dec2_buf: [256]u8 = undefined;
+    const d2 = try decrypt(key, nonce2, e2, &dec2_buf);
+    try std.testing.expectEqualStrings(plaintext, d2);
+}
+
+test "decrypt with wrong key fails" {
+    const key1 = @as([32]u8, @splat(0x01));
+    const key2 = @as([32]u8, @splat(0x02));
+    const nonce = @as([12]u8, @splat(0xAB));
+    const plaintext = "secret message";
+
+    var enc_buf: [256]u8 = undefined;
+    const encrypted = try encrypt(key1, nonce, plaintext, &enc_buf);
+
+    var dec_buf: [256]u8 = undefined;
+    const result = decrypt(key2, nonce, encrypted, &dec_buf);
+    try std.testing.expectError(error.DecryptionFailed, result);
+}
+
+test "encrypt buffer too small fails" {
+    const key = @as([32]u8, @splat(0x42));
+    const nonce = @as([12]u8, @splat(0x01));
+    const plaintext = "hello";
+
+    var tiny_buf: [5]u8 = undefined; // Too small (needs plaintext.len + 16 for tag)
+    const result = encrypt(key, nonce, plaintext, &tiny_buf);
+    try std.testing.expectError(error.BufferTooSmall, result);
+}
+
+test "decrypt ciphertext too short fails" {
+    const key = @as([32]u8, @splat(0x42));
+    const nonce = @as([12]u8, @splat(0x01));
+
+    // Less than tag length
+    var dec_buf: [256]u8 = undefined;
+    const result = decrypt(key, nonce, "short", &dec_buf);
+    try std.testing.expectError(error.CiphertextTooShort, result);
+}
+
+test "hmac same input same output" {
+    const r1 = hmacSha256("key", "message");
+    const r2 = hmacSha256("key", "message");
+    try std.testing.expectEqualSlices(u8, &r1, &r2);
+}
+
+test "hmac different keys different output" {
+    const r1 = hmacSha256("key1", "message");
+    const r2 = hmacSha256("key2", "message");
+    try std.testing.expect(!std.mem.eql(u8, &r1, &r2));
+}
+
+test "hmac different messages different output" {
+    const r1 = hmacSha256("key", "message1");
+    const r2 = hmacSha256("key", "message2");
+    try std.testing.expect(!std.mem.eql(u8, &r1, &r2));
+}
+
+test "hex encode empty" {
+    var buf: [4]u8 = undefined;
+    const result = hexEncode(&[_]u8{}, &buf);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "hex decode empty" {
+    var buf: [4]u8 = undefined;
+    const result = try hexDecode("", &buf);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "hex encode all bytes" {
+    const data = [_]u8{ 0x00, 0xff };
+    var buf: [4]u8 = undefined;
+    const result = hexEncode(&data, &buf);
+    try std.testing.expectEqualStrings("00ff", result);
+}
+
+test "hex decode uppercase" {
+    var buf: [2]u8 = undefined;
+    const result = try hexDecode("AABB", &buf);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB }, result);
+}
+
+test "hex decode mixed case" {
+    var buf: [2]u8 = undefined;
+    const result = try hexDecode("aAbB", &buf);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB }, result);
+}
+
+test "secret store is encrypted short strings" {
+    try std.testing.expect(!SecretStore.isEncrypted("enc"));
+    try std.testing.expect(!SecretStore.isEncrypted("enc2"));
+    try std.testing.expect(SecretStore.isEncrypted("enc2:x"));
+    try std.testing.expect(!SecretStore.isEncrypted("ENC2:x"));
+}
+
+test "secret store encrypt decrypt multiple values same store" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const store = SecretStore.init(tmp_path, true);
+
+    const secrets = [_][]const u8{ "secret-1", "secret-2", "secret-3" };
+    var encrypted: [3][]u8 = undefined;
+
+    for (secrets, 0..) |s, i| {
+        encrypted[i] = try store.encryptSecret(std.testing.allocator, s);
+    }
+    defer for (&encrypted) |e| std.testing.allocator.free(e);
+
+    for (secrets, 0..) |expected, i| {
+        const dec = try store.decryptSecret(std.testing.allocator, encrypted[i]);
+        defer std.testing.allocator.free(dec);
+        try std.testing.expectEqualStrings(expected, dec);
+    }
+}
+
+test "ChaCha20Poly1305.decrypt tag failure returns DecryptionFailed not segfault" {
+    const key: [32]u8 = @as([32]u8, @splat(1));
+    const nonce: [12]u8 = @as([12]u8, @splat(2));
+    const plaintext = "secret data";
+
+    // Encrypt to a stack buffer.
+    var ct_buf: [64]u8 = undefined;
+    const ct = try encrypt(key, nonce, plaintext, &ct_buf);
+
+    // Tamper the last byte (corrupts the auth tag).
+    var tampered: [64]u8 = ct_buf;
+    tampered[ct.len - 1] ^= 0xFF;
+
+    // Decrypt MUST return error, not segfault. Stack buffer is the
+    // only allowed output target per AGENTS.md §10.
+    var pt_buf: [64]u8 = undefined;
+    const result = decrypt(key, nonce, tampered[0..ct.len], &pt_buf);
+    try std.testing.expectError(error.DecryptionFailed, result);
+
+    // Tamper at start-of-tag boundary (offset = ct.len - 16, the first byte
+    // of Poly1305 tag) — catches a hypothetical regression where only the
+    // tag-trailing byte is checked.
+    var tampered2: [64]u8 = ct_buf;
+    const tag_start = ct.len - 16;
+    tampered2[tag_start] ^= 0xFF;
+    var pt_buf2: [64]u8 = undefined;
+    try std.testing.expectError(error.DecryptionFailed, decrypt(key, nonce, tampered2[0..ct.len], &pt_buf2));
+
+    // Tamper a ciphertext byte (before the tag) — the AEAD must reject
+    // the modification because it invalidates the Poly1305 MAC.
+    var tampered3: [64]u8 = ct_buf;
+    tampered3[0] ^= 0xFF;
+    var pt_buf3: [64]u8 = undefined;
+    try std.testing.expectError(error.DecryptionFailed, decrypt(key, nonce, tampered3[0..ct.len], &pt_buf3));
+}

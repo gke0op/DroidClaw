@@ -1,0 +1,4314 @@
+const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
+const config_paths = @import("config_paths.zig");
+const platform = @import("platform.zig");
+const bus = @import("bus.zig");
+const fs_compat = @import("fs_compat.zig");
+const json_util = @import("json_util.zig");
+const observability = @import("observability.zig");
+const admin_output = @import("admin_output.zig");
+const agent_routing = @import("agent_routing.zig");
+const telegram = @import("channels/telegram.zig");
+const signal = @import("channels/signal.zig");
+const Config = @import("config.zig").Config;
+const process_util = @import("tools/process_util.zig");
+const security_policy = @import("security/policy.zig");
+const secrets = @import("security/secrets.zig");
+
+const log = std.log.scoped(.cron);
+const DEFAULT_CRON_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
+const DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES: usize = 1_048_576;
+const safe_env_vars = [_][]const u8{ "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR" };
+
+pub const JobType = enum {
+    shell,
+    agent,
+
+    pub fn asStr(self: JobType) []const u8 {
+        return switch (self) {
+            .shell => "shell",
+            .agent => "agent",
+        };
+    }
+
+    pub fn parse(raw: []const u8) JobType {
+        if (std.ascii.eqlIgnoreCase(raw, "agent")) return .agent;
+        return .shell;
+    }
+};
+
+pub const SessionTarget = enum {
+    isolated,
+    main,
+
+    pub fn asStr(self: SessionTarget) []const u8 {
+        return switch (self) {
+            .isolated => "isolated",
+            .main => "main",
+        };
+    }
+
+    pub fn parse(raw: []const u8) SessionTarget {
+        if (std.ascii.eqlIgnoreCase(raw, "main")) return .main;
+        return .isolated;
+    }
+
+    pub fn parseStrict(raw: []const u8) !SessionTarget {
+        if (std.ascii.eqlIgnoreCase(raw, "isolated")) return .isolated;
+        if (std.ascii.eqlIgnoreCase(raw, "main")) return .main;
+        return error.InvalidSessionTarget;
+    }
+};
+
+pub const ScheduleKind = enum { cron, at, every };
+
+pub const Schedule = union(ScheduleKind) {
+    cron: struct { expr: []const u8, tz: ?[]const u8 },
+    at: struct { timestamp_s: i64 },
+    every: struct { every_ms: u64 },
+};
+
+pub const DeliveryMode = enum {
+    none,
+    always,
+    on_error,
+    on_success,
+
+    pub fn asStr(self: DeliveryMode) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .always => "always",
+            .on_error => "on_error",
+            .on_success => "on_success",
+        };
+    }
+
+    pub fn parse(raw: []const u8) DeliveryMode {
+        if (std.ascii.eqlIgnoreCase(raw, "always")) return .always;
+        if (std.ascii.eqlIgnoreCase(raw, "on_error")) return .on_error;
+        if (std.ascii.eqlIgnoreCase(raw, "on_success")) return .on_success;
+        return .none;
+    }
+};
+
+pub const DeliveryConfig = struct {
+    mode: DeliveryMode = .none,
+    channel: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    to: ?[]const u8 = null,
+    peer_kind: ?agent_routing.ChatType = null,
+    peer_id: ?[]const u8 = null,
+    thread_id: ?[]const u8 = null,
+    best_effort: bool = true,
+    channel_owned: bool = false,
+    account_id_owned: bool = false,
+    to_owned: bool = false,
+    peer_id_owned: bool = false,
+    thread_id_owned: bool = false,
+};
+
+fn chatTypeAsStr(kind: agent_routing.ChatType) []const u8 {
+    return switch (kind) {
+        .direct => "direct",
+        .group => "group",
+        .channel => "channel",
+    };
+}
+
+fn parseChatType(raw: []const u8) ?agent_routing.ChatType {
+    if (std.mem.eql(u8, raw, "direct")) return .direct;
+    if (std.mem.eql(u8, raw, "group")) return .group;
+    if (std.mem.eql(u8, raw, "channel")) return .channel;
+    return null;
+}
+
+pub fn enrichDeliveryRouting(delivery: DeliveryConfig) DeliveryConfig {
+    var enriched = delivery;
+    const channel = enriched.channel orelse return enriched;
+    const target = enriched.to orelse return enriched;
+
+    if (std.mem.eql(u8, channel, "telegram")) {
+        const base_chat_id = telegram.targetChatId(target);
+        if (enriched.peer_id == null) enriched.peer_id = base_chat_id;
+        if (enriched.peer_kind == null) {
+            enriched.peer_kind = if (telegram.targetThreadId(target) != null or
+                (base_chat_id.len > 0 and base_chat_id[0] == '-'))
+                .group
+            else
+                .direct;
+        }
+        return enriched;
+    }
+
+    if (std.mem.eql(u8, channel, "signal")) {
+        if (enriched.peer_id == null) enriched.peer_id = signal.signalGroupPeerId(target);
+        if (enriched.peer_kind == null) {
+            enriched.peer_kind = if (std.mem.startsWith(u8, target, signal.GROUP_TARGET_PREFIX))
+                .group
+            else
+                .direct;
+        }
+        return enriched;
+    }
+
+    if (enriched.peer_kind != null and enriched.peer_id == null) {
+        enriched.peer_id = target;
+    }
+    return enriched;
+}
+
+pub const CronRun = struct {
+    id: u64,
+    job_id: []const u8,
+    started_at_s: i64,
+    finished_at_s: i64,
+    status: []const u8,
+    output: ?[]const u8,
+    duration_ms: ?i64,
+};
+
+pub const CronJobPatch = struct {
+    expression: ?[]const u8 = null,
+    command: ?[]const u8 = null,
+    prompt: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    enabled: ?bool = null,
+    model: ?[]const u8 = null,
+    delete_after_run: ?bool = null,
+    session_target: ?SessionTarget = null,
+};
+
+/// A scheduled cron job.
+pub const CronJob = struct {
+    id: []const u8,
+    expression: []const u8,
+    command: []const u8,
+    next_run_secs: i64 = 0,
+    last_run_secs: ?i64 = null,
+    last_status: ?[]const u8 = null,
+    paused: bool = false,
+    one_shot: bool = false,
+    job_type: JobType = .shell,
+    session_target: SessionTarget = .isolated,
+    prompt: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    enabled: bool = true,
+    delete_after_run: bool = false,
+    created_at_s: i64 = 0,
+    last_output: ?[]const u8 = null,
+    delivery: DeliveryConfig = .{},
+};
+
+/// Duration unit for "once" delay parsing.
+pub const DurationUnit = enum {
+    seconds,
+    minutes,
+    hours,
+    days,
+    weeks,
+};
+
+/// Parse a human delay string like "30m", "2h", "1d" into seconds.
+pub fn parseDuration(input: []const u8) !i64 {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyDelay;
+
+    // Check if last char is a unit letter
+    const last = trimmed[trimmed.len - 1];
+    var num_str: []const u8 = undefined;
+    var multiplier: i64 = undefined;
+
+    if (std.ascii.isAlphabetic(last)) {
+        num_str = trimmed[0 .. trimmed.len - 1];
+        multiplier = switch (last) {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86400,
+            'w' => 604800,
+            else => return error.UnknownDurationUnit,
+        };
+    } else {
+        num_str = trimmed;
+        multiplier = 60; // default to minutes
+    }
+
+    const n = std.fmt.parseInt(i64, std.mem.trim(u8, num_str, " "), 10) catch return error.InvalidDurationNumber;
+    if (n <= 0) return error.InvalidDurationNumber;
+
+    const secs = std.math.mul(i64, n, multiplier) catch return error.DurationTooLarge;
+    return secs;
+}
+
+/// Normalize a cron expression (5 fields -> prepend "0" for seconds).
+pub fn normalizeExpression(expression: []const u8) !CronNormalized {
+    const trimmed = std.mem.trim(u8, expression, " \t\r\n");
+    var field_count: usize = 0;
+    var in_field = false;
+
+    for (trimmed) |c| {
+        if (c == ' ' or c == '\t') {
+            if (in_field) {
+                in_field = false;
+            }
+        } else {
+            if (!in_field) {
+                field_count += 1;
+                in_field = true;
+            }
+        }
+    }
+
+    return switch (field_count) {
+        5 => .{ .expression = trimmed, .needs_second_prefix = true },
+        6, 7 => .{ .expression = trimmed, .needs_second_prefix = false },
+        else => error.InvalidCronExpression,
+    };
+}
+
+pub const CronNormalized = struct {
+    expression: []const u8,
+    needs_second_prefix: bool,
+};
+
+const MAX_CRON_LOOKAHEAD_MINUTES: usize = 8 * 366 * 24 * 60;
+
+const ParsedCronExpression = struct {
+    minutes: [60]bool = @as([60]bool, @splat(false)),
+    hours: [24]bool = @as([24]bool, @splat(false)),
+    day_of_month: [32]bool = @as([32]bool, @splat(false)), // 1..31
+    months: [13]bool = @as([13]bool, @splat(false)), // 1..12
+    day_of_week: [7]bool = @as([7]bool, @splat(false)), // 0..6 (0=Sun)
+    day_of_month_any: bool = false,
+    day_of_week_any: bool = false,
+};
+
+fn parseCronRawValue(raw: []const u8, min: u8, max: u8, allow_sunday_7: bool) !u8 {
+    const value = std.fmt.parseInt(u8, std.mem.trim(u8, raw, " \t"), 10) catch return error.InvalidCronExpression;
+    const max_allowed: u8 = if (allow_sunday_7) 7 else max;
+    if (value < min or value > max_allowed) return error.InvalidCronExpression;
+    return value;
+}
+
+fn normalizeCronValue(raw_value: u8, allow_sunday_7: bool) u8 {
+    if (allow_sunday_7 and raw_value == 7) return 0;
+    return raw_value;
+}
+
+fn clearBoolSlice(values: []bool) void {
+    for (values) |*entry| entry.* = false;
+}
+
+fn parseCronField(raw_field: []const u8, min: u8, max: u8, allow_sunday_7: bool, out: []bool) !bool {
+    if (out.len <= max) return error.InvalidCronExpression;
+    clearBoolSlice(out);
+
+    const field = std.mem.trim(u8, raw_field, " \t");
+    if (field.len == 0) return error.InvalidCronExpression;
+    const is_any = std.mem.eql(u8, field, "*");
+
+    var saw_value = false;
+    var parts = std.mem.splitScalar(u8, field, ',');
+    while (parts.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t");
+        if (part.len == 0) return error.InvalidCronExpression;
+
+        var range_part = part;
+        var step: u8 = 1;
+        var has_step = false;
+        if (std.mem.indexOfScalar(u8, part, '/')) |slash_idx| {
+            range_part = std.mem.trim(u8, part[0..slash_idx], " \t");
+            const step_raw = std.mem.trim(u8, part[slash_idx + 1 ..], " \t");
+            if (range_part.len == 0 or step_raw.len == 0) return error.InvalidCronExpression;
+            step = std.fmt.parseInt(u8, step_raw, 10) catch return error.InvalidCronExpression;
+            if (step == 0) return error.InvalidCronExpression;
+            has_step = true;
+        }
+
+        var start_raw: u8 = min;
+        var end_raw: u8 = max;
+        if (std.mem.eql(u8, range_part, "*")) {
+            // full range
+        } else if (std.mem.indexOfScalar(u8, range_part, '-')) |dash_idx| {
+            const start_part = std.mem.trim(u8, range_part[0..dash_idx], " \t");
+            const end_part = std.mem.trim(u8, range_part[dash_idx + 1 ..], " \t");
+            if (start_part.len == 0 or end_part.len == 0) return error.InvalidCronExpression;
+            start_raw = try parseCronRawValue(start_part, min, max, allow_sunday_7);
+            end_raw = try parseCronRawValue(end_part, min, max, allow_sunday_7);
+            if (start_raw > end_raw) return error.InvalidCronExpression;
+        } else {
+            start_raw = try parseCronRawValue(range_part, min, max, allow_sunday_7);
+            if (has_step) {
+                start_raw = normalizeCronValue(start_raw, allow_sunday_7);
+                end_raw = max;
+            } else {
+                end_raw = start_raw;
+            }
+        }
+
+        var raw_value = start_raw;
+        while (raw_value <= end_raw) {
+            const normalized = normalizeCronValue(raw_value, allow_sunday_7);
+            if (normalized < min or normalized > max) return error.InvalidCronExpression;
+            out[normalized] = true;
+            saw_value = true;
+
+            const next = @addWithOverflow(raw_value, step);
+            if (next[1] != 0 or next[0] <= raw_value) break;
+            raw_value = next[0];
+        }
+    }
+
+    if (!saw_value) return error.InvalidCronExpression;
+    return is_any;
+}
+
+fn parseCronExpression(expression: []const u8) !ParsedCronExpression {
+    const trimmed = std.mem.trim(u8, expression, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidCronExpression;
+
+    var fields: [7][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, trimmed, " \t\r\n");
+    while (it.next()) |field| {
+        if (count >= fields.len) return error.InvalidCronExpression;
+        fields[count] = field;
+        count += 1;
+    }
+
+    if (count < 5 or count > 7) return error.InvalidCronExpression;
+
+    const minute_field: []const u8 = switch (count) {
+        5 => fields[0],
+        6, 7 => fields[1],
+        else => unreachable,
+    };
+    const hour_field: []const u8 = switch (count) {
+        5 => fields[1],
+        6, 7 => fields[2],
+        else => unreachable,
+    };
+    const dom_field: []const u8 = switch (count) {
+        5 => fields[2],
+        6, 7 => fields[3],
+        else => unreachable,
+    };
+    const month_field: []const u8 = switch (count) {
+        5 => fields[3],
+        6, 7 => fields[4],
+        else => unreachable,
+    };
+    const dow_field: []const u8 = switch (count) {
+        5 => fields[4],
+        6, 7 => fields[5],
+        else => unreachable,
+    };
+
+    var parsed = ParsedCronExpression{};
+    _ = try parseCronField(minute_field, 0, 59, false, parsed.minutes[0..]);
+    _ = try parseCronField(hour_field, 0, 23, false, parsed.hours[0..]);
+    parsed.day_of_month_any = try parseCronField(dom_field, 1, 31, false, parsed.day_of_month[0..]);
+    _ = try parseCronField(month_field, 1, 12, false, parsed.months[0..]);
+    parsed.day_of_week_any = try parseCronField(dow_field, 0, 6, true, parsed.day_of_week[0..]);
+
+    return parsed;
+}
+
+fn cronExpressionMatches(parsed: *const ParsedCronExpression, ts: i64) bool {
+    if (ts < 0) return false;
+
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(ts) };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    const minute: u8 = day_seconds.getMinutesIntoHour();
+    const hour: u8 = day_seconds.getHoursIntoDay();
+    const day_of_month: u8 = @as(u8, @intCast(month_day.day_index + 1));
+    const month: u8 = month_day.month.numeric();
+    const day_of_week: u8 = @as(u8, @intCast((epoch_day.day + 4) % 7)); // 1970-01-01 was Thursday (4)
+
+    if (!parsed.minutes[minute]) return false;
+    if (!parsed.hours[hour]) return false;
+    if (!parsed.months[month]) return false;
+
+    const dom_match = parsed.day_of_month[day_of_month];
+    const dow_match = parsed.day_of_week[day_of_week];
+
+    const day_match = if (parsed.day_of_month_any and parsed.day_of_week_any)
+        true
+    else if (parsed.day_of_month_any)
+        dow_match
+    else if (parsed.day_of_week_any)
+        dom_match
+    else
+        dom_match or dow_match;
+
+    return day_match;
+}
+
+fn alignToNextMinute(from_secs: i64) i64 {
+    var start = from_secs + 1;
+    if (start < 0) start = 0;
+    const rem = @mod(start, 60);
+    if (rem == 0) return start;
+    return start + (60 - rem);
+}
+
+fn nextRunForCronExpression(expression: []const u8, from_secs: i64) !i64 {
+    const parsed = try parseCronExpression(expression);
+    var candidate = alignToNextMinute(from_secs);
+
+    var i: usize = 0;
+    while (i < MAX_CRON_LOOKAHEAD_MINUTES) : (i += 1) {
+        if (cronExpressionMatches(&parsed, candidate)) return candidate;
+        candidate += 60;
+    }
+    return error.NoFutureRunFound;
+}
+
+/// In-memory cron job store (no SQLite dependency for the minimal Zig port).
+pub const CronScheduler = struct {
+    jobs: std.ArrayListUnmanaged(CronJob),
+    runs: std.ArrayListUnmanaged(CronRun) = .empty,
+    next_run_id: u64 = 1,
+    next_job_id: u64 = 1,
+    max_tasks: usize,
+    enabled: bool,
+    allocator: std.mem.Allocator,
+    shell_cwd: ?[]const u8 = null,
+    agent_timeout_secs: u64 = 0,
+    shell_timeout_ns: u64 = DEFAULT_CRON_SHELL_TIMEOUT_NS,
+    shell_max_output_bytes: usize = DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES,
+    shell_policy: security_policy.SecurityPolicy = .{},
+    observer: ?observability.Observer = null,
+
+    pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
+        return .{
+            .jobs = .empty,
+            .max_tasks = max_tasks,
+            .enabled = enabled,
+            .allocator = allocator,
+            .shell_cwd = null,
+            .agent_timeout_secs = 0,
+            .shell_timeout_ns = DEFAULT_CRON_SHELL_TIMEOUT_NS,
+            .shell_max_output_bytes = DEFAULT_CRON_SHELL_MAX_OUTPUT_BYTES,
+            .shell_policy = .{},
+        };
+    }
+
+    pub fn setShellCwd(self: *CronScheduler, cwd: []const u8) void {
+        self.shell_cwd = cwd;
+    }
+
+    pub fn setAgentTimeoutSecs(self: *CronScheduler, timeout_secs: u64) void {
+        self.agent_timeout_secs = timeout_secs;
+    }
+
+    pub fn setShellPolicy(self: *CronScheduler, policy: security_policy.SecurityPolicy) void {
+        self.shell_policy = policy;
+    }
+
+    pub fn setShellLimits(self: *CronScheduler, timeout_ns: u64, max_output_bytes: usize) void {
+        self.shell_timeout_ns = timeout_ns;
+        self.shell_max_output_bytes = max_output_bytes;
+    }
+
+    fn validateShellCommand(self: *const CronScheduler, command: []const u8) !void {
+        _ = try self.shell_policy.validateCommandExecution(command, false);
+    }
+
+    fn freeJobOwned(self: *CronScheduler, job: CronJob) void {
+        self.allocator.free(job.id);
+        self.allocator.free(job.expression);
+        self.allocator.free(job.command);
+        if (job.prompt) |prompt| self.allocator.free(prompt);
+        if (job.name) |name| self.allocator.free(name);
+        if (job.model) |model| self.allocator.free(model);
+        if (job.last_output) |output| self.allocator.free(output);
+        if (job.delivery.channel_owned) {
+            if (job.delivery.channel) |channel| self.allocator.free(channel);
+        }
+        if (job.delivery.account_id_owned) {
+            if (job.delivery.account_id) |account_id| self.allocator.free(account_id);
+        }
+        if (job.delivery.to_owned) {
+            if (job.delivery.to) |to| self.allocator.free(to);
+        }
+        if (job.delivery.peer_id_owned) {
+            if (job.delivery.peer_id) |peer_id| self.allocator.free(peer_id);
+        }
+        if (job.delivery.thread_id_owned) {
+            if (job.delivery.thread_id) |thread_id| self.allocator.free(thread_id);
+        }
+    }
+
+    pub fn deinit(self: *CronScheduler) void {
+        for (self.runs.items) |r| {
+            self.allocator.free(r.job_id);
+            self.allocator.free(r.status);
+            if (r.output) |o| self.allocator.free(o);
+        }
+        self.runs.deinit(self.allocator);
+        self.clearJobs();
+        self.jobs.deinit(self.allocator);
+    }
+
+    fn allocateJobId(self: *CronScheduler, prefix: []const u8) ![]const u8 {
+        while (true) {
+            var id_buf: [48]u8 = undefined;
+            const id = std.fmt.bufPrint(&id_buf, "{s}-{d}", .{ prefix, self.next_job_id }) catch unreachable;
+            self.next_job_id +%= 1;
+            if (self.next_job_id == 0) self.next_job_id = 1;
+            if (self.getJob(id) == null) {
+                return try self.allocator.dupe(u8, id);
+            }
+        }
+    }
+
+    fn clearJobs(self: *CronScheduler) void {
+        for (self.jobs.items) |job| {
+            self.freeJobOwned(job);
+        }
+        self.jobs.clearRetainingCapacity();
+    }
+
+    /// Add a recurring cron job.
+    pub fn addJob(self: *CronScheduler, expression: []const u8, command: []const u8) !*CronJob {
+        if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+        try self.validateShellCommand(command);
+
+        // Validate expression
+        _ = try normalizeExpression(expression);
+        const now = std_compat.time.timestamp();
+        const next_run_secs = try nextRunForCronExpression(expression, now);
+
+        const id = try self.allocateJobId("job");
+        errdefer self.allocator.free(id);
+
+        try self.jobs.append(self.allocator, .{
+            .id = id,
+            .expression = try self.allocator.dupe(u8, expression),
+            .command = try self.allocator.dupe(u8, command),
+            .next_run_secs = next_run_secs,
+        });
+
+        return &self.jobs.items[self.jobs.items.len - 1];
+    }
+
+    /// Add a one-shot delayed task.
+    pub fn addOnce(self: *CronScheduler, delay: []const u8, command: []const u8) !*CronJob {
+        if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+        try self.validateShellCommand(command);
+
+        const delay_secs = try parseDuration(delay);
+        const now = std_compat.time.timestamp();
+
+        const id = try self.allocateJobId("once");
+        errdefer self.allocator.free(id);
+
+        var expr_buf: [64]u8 = undefined;
+        const expr = std.fmt.bufPrint(&expr_buf, "@once:{s}", .{delay}) catch "@once";
+
+        try self.jobs.append(self.allocator, .{
+            .id = id,
+            .expression = try self.allocator.dupe(u8, expr),
+            .command = try self.allocator.dupe(u8, command),
+            .next_run_secs = now + delay_secs,
+            .one_shot = true,
+        });
+
+        return &self.jobs.items[self.jobs.items.len - 1];
+    }
+
+    /// Add a recurring agent job.
+    pub fn addAgentJob(self: *CronScheduler, expression: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !*CronJob {
+        if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+
+        _ = try normalizeExpression(expression);
+        const now = std_compat.time.timestamp();
+        const next_run_secs = try nextRunForCronExpression(expression, now);
+
+        const id = try self.allocateJobId("agent");
+        errdefer self.allocator.free(id);
+
+        try self.jobs.append(self.allocator, .{
+            .id = id,
+            .expression = try self.allocator.dupe(u8, expression),
+            .command = try self.allocator.dupe(u8, prompt),
+            .next_run_secs = next_run_secs,
+            .job_type = .agent,
+            .prompt = try self.allocator.dupe(u8, prompt),
+            .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+            .delivery = .{
+                .mode = delivery.mode,
+                .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
+                .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
+                .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .peer_kind = delivery.peer_kind,
+                .peer_id = if (delivery.peer_id) |peer_id| try self.allocator.dupe(u8, peer_id) else null,
+                .thread_id = if (delivery.thread_id) |thread_id| try self.allocator.dupe(u8, thread_id) else null,
+                .channel_owned = delivery.channel != null,
+                .account_id_owned = delivery.account_id != null,
+                .to_owned = delivery.to != null,
+                .peer_id_owned = delivery.peer_id != null,
+                .thread_id_owned = delivery.thread_id != null,
+                .best_effort = delivery.best_effort,
+            },
+        });
+
+        return &self.jobs.items[self.jobs.items.len - 1];
+    }
+
+    /// Add a one-shot delayed agent task.
+    pub fn addAgentOnce(self: *CronScheduler, delay: []const u8, prompt: []const u8, model: ?[]const u8, delivery: DeliveryConfig) !*CronJob {
+        if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+
+        const delay_secs = try parseDuration(delay);
+        const now = std_compat.time.timestamp();
+
+        const id = try self.allocateJobId("agent-once");
+        errdefer self.allocator.free(id);
+
+        var expr_buf: [64]u8 = undefined;
+        const expr = std.fmt.bufPrint(&expr_buf, "@once:{s}", .{delay}) catch "@once";
+
+        try self.jobs.append(self.allocator, .{
+            .id = id,
+            .expression = try self.allocator.dupe(u8, expr),
+            .command = try self.allocator.dupe(u8, prompt),
+            .next_run_secs = now + delay_secs,
+            .one_shot = true,
+            .job_type = .agent,
+            .prompt = try self.allocator.dupe(u8, prompt),
+            .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+            .delivery = .{
+                .mode = delivery.mode,
+                .channel = if (delivery.channel) |c| try self.allocator.dupe(u8, c) else null,
+                .account_id = if (delivery.account_id) |aid| try self.allocator.dupe(u8, aid) else null,
+                .to = if (delivery.to) |t| try self.allocator.dupe(u8, t) else null,
+                .peer_kind = delivery.peer_kind,
+                .peer_id = if (delivery.peer_id) |peer_id| try self.allocator.dupe(u8, peer_id) else null,
+                .thread_id = if (delivery.thread_id) |thread_id| try self.allocator.dupe(u8, thread_id) else null,
+                .channel_owned = delivery.channel != null,
+                .account_id_owned = delivery.account_id != null,
+                .to_owned = delivery.to != null,
+                .peer_id_owned = delivery.peer_id != null,
+                .thread_id_owned = delivery.thread_id != null,
+                .best_effort = delivery.best_effort,
+            },
+        });
+
+        return &self.jobs.items[self.jobs.items.len - 1];
+    }
+
+    /// List all jobs.
+    pub fn listJobs(self: *const CronScheduler) []const CronJob {
+        return self.jobs.items;
+    }
+
+    /// Get a job by ID.
+    pub fn getJob(self: *const CronScheduler, id: []const u8) ?*const CronJob {
+        for (self.jobs.items) |*job| {
+            if (std.mem.eql(u8, job.id, id)) return job;
+        }
+        return null;
+    }
+
+    /// Get a mutable pointer to a job by ID.
+    pub fn getMutableJob(self: *CronScheduler, id: []const u8) ?*CronJob {
+        for (self.jobs.items) |*job| {
+            if (std.mem.eql(u8, job.id, id)) return job;
+        }
+        return null;
+    }
+
+    /// Update a job's fields from a patch.
+    pub fn updateJob(self: *CronScheduler, allocator: std.mem.Allocator, id: []const u8, patch: CronJobPatch) bool {
+        const job = self.getMutableJob(id) orelse return false;
+        if (patch.expression) |expr| {
+            const next_run_secs = nextRunForCronExpression(expr, std_compat.time.timestamp()) catch return false;
+            const new_expr = allocator.dupe(u8, expr) catch return false;
+            allocator.free(job.expression);
+            job.expression = new_expr;
+            job.next_run_secs = next_run_secs;
+        }
+        if (patch.command) |cmd| {
+            if (job.job_type == .shell) self.validateShellCommand(cmd) catch return false;
+            const new_cmd = allocator.dupe(u8, cmd) catch return false;
+            allocator.free(job.command);
+            job.command = new_cmd;
+
+            // Back-compat behavior: for agent jobs, --command should still update
+            // the effective prompt if --prompt was not provided explicitly.
+            if (job.job_type == .agent and patch.prompt == null) {
+                const new_prompt = allocator.dupe(u8, cmd) catch return false;
+                if (job.prompt) |old_prompt| allocator.free(old_prompt);
+                job.prompt = new_prompt;
+            }
+        }
+        if (patch.prompt) |prompt| {
+            const new_prompt = allocator.dupe(u8, prompt) catch return false;
+            if (job.prompt) |old_prompt| allocator.free(old_prompt);
+            job.prompt = new_prompt;
+
+            // Keep command text aligned with prompt for agent jobs so display/list
+            // and fallback behavior stay coherent.
+            if (job.job_type == .agent) {
+                const new_cmd = allocator.dupe(u8, prompt) catch return false;
+                allocator.free(job.command);
+                job.command = new_cmd;
+            }
+        }
+        if (patch.model) |model| {
+            const new_model = allocator.dupe(u8, model) catch return false;
+            if (job.model) |old_model| allocator.free(old_model);
+            job.model = new_model;
+        }
+        if (patch.enabled) |ena| {
+            job.enabled = ena;
+            job.paused = !ena;
+        }
+        if (patch.delete_after_run) |d| {
+            job.delete_after_run = d;
+            job.one_shot = d;
+        }
+        if (patch.session_target) |st| {
+            job.session_target = st;
+        }
+        return true;
+    }
+
+    /// Record a completed run for a job.
+    pub fn addRun(self: *CronScheduler, allocator: std.mem.Allocator, job_id: []const u8, started_at_s: i64, finished_at_s: i64, status: []const u8, output: ?[]const u8, max_history: usize) !void {
+        const entry = CronRun{
+            .id = self.next_run_id,
+            .job_id = try allocator.dupe(u8, job_id),
+            .started_at_s = started_at_s,
+            .finished_at_s = finished_at_s,
+            .status = try allocator.dupe(u8, status),
+            .output = if (output) |o| try allocator.dupe(u8, o) else null,
+            .duration_ms = (finished_at_s - started_at_s) * 1000,
+        };
+        self.next_run_id += 1;
+        try self.runs.append(allocator, entry);
+        // Prune to max_history per job_id
+        if (max_history > 0) {
+            var count: usize = 0;
+            var i: usize = self.runs.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (std.mem.eql(u8, self.runs.items[i].job_id, job_id)) {
+                    count += 1;
+                    if (count > max_history) {
+                        // Free strings of the pruned run
+                        allocator.free(self.runs.items[i].job_id);
+                        allocator.free(self.runs.items[i].status);
+                        if (self.runs.items[i].output) |o| allocator.free(o);
+                        _ = self.runs.orderedRemove(i);
+                    }
+                }
+            }
+        }
+    }
+
+    /// List recent runs for a given job_id, up to `limit` entries.
+    pub fn listRuns(self: *const CronScheduler, allocator: std.mem.Allocator, job_id: []const u8, limit: usize) ![]CronRun {
+        var filtered: std.ArrayListUnmanaged(CronRun) = .empty;
+        errdefer filtered.deinit(allocator);
+
+        if (limit == 0) return try filtered.toOwnedSlice(allocator);
+
+        var i: usize = self.runs.items.len;
+        while (i > 0 and filtered.items.len < limit) {
+            i -= 1;
+            const run_entry = self.runs.items[i];
+            if (!std.mem.eql(u8, run_entry.job_id, job_id)) continue;
+            try filtered.append(allocator, run_entry);
+        }
+
+        std.mem.reverse(CronRun, filtered.items);
+        return try filtered.toOwnedSlice(allocator);
+    }
+
+    /// Remove a job by ID, freeing its owned strings.
+    pub fn removeJob(self: *CronScheduler, id: []const u8) bool {
+        for (self.jobs.items, 0..) |job, i| {
+            if (std.mem.eql(u8, job.id, id)) {
+                self.freeJobOwned(job);
+                _ = self.jobs.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Pause a job.
+    pub fn pauseJob(self: *CronScheduler, id: []const u8) bool {
+        for (self.jobs.items) |*job| {
+            if (std.mem.eql(u8, job.id, id)) {
+                job.paused = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Resume a job.
+    pub fn resumeJob(self: *CronScheduler, id: []const u8) bool {
+        for (self.jobs.items) |*job| {
+            if (std.mem.eql(u8, job.id, id)) {
+                job.paused = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Get due (non-paused) jobs whose next_run <= now.
+    pub fn dueJobs(self: *const CronScheduler, allocator: std.mem.Allocator, now_secs: i64) ![]const CronJob {
+        var result: std.ArrayListUnmanaged(CronJob) = .empty;
+        for (self.jobs.items) |job| {
+            if (!job.paused and job.next_run_secs <= now_secs) {
+                try result.append(allocator, job);
+            }
+        }
+        return result.items;
+    }
+
+    /// Main scheduler loop: check all jobs, execute due ones, sleep until next.
+    /// If `out_bus` is provided, job results are delivered to channels per delivery config.
+    pub fn run(self: *CronScheduler, poll_secs: u64, out_bus: ?*bus.Bus) void {
+        if (!self.enabled) return;
+
+        const poll_ns: u64 = poll_secs * std.time.ns_per_s;
+
+        while (true) {
+            const now = std_compat.time.timestamp();
+            _ = self.tick(now, out_bus);
+            std_compat.thread.sleep(poll_ns);
+        }
+    }
+
+    /// Execute one tick of the scheduler: run all due jobs, deliver results, handle one-shots.
+    /// Separated from `run` for testability.
+    pub fn tick(self: *CronScheduler, now: i64, out_bus: ?*bus.Bus) bool {
+        var changed = false;
+
+        // Collect indices of one-shot jobs to remove after iteration
+        var remove_indices: std.ArrayListUnmanaged(usize) = .empty;
+        defer remove_indices.deinit(self.allocator);
+
+        for (self.jobs.items, 0..) |*job, idx| {
+            if (job.paused or job.next_run_secs > now) continue;
+            changed = true;
+
+            if (self.observer) |obs| {
+                const event = observability.ObserverEvent{ .cron_job_start = .{
+                    .task = job.command,
+                    .channel = job.delivery.channel,
+                    .bot_account = job.delivery.account_id,
+                } };
+                obs.recordEvent(&event);
+            }
+
+            switch (job.job_type) {
+                .shell => {
+                    self.validateShellCommand(job.command) catch |err| {
+                        log.warn("cron shell job '{s}' blocked by security policy: {s}", .{ job.id, @errorName(err) });
+                        job.last_status = "error";
+                        job.last_run_secs = now;
+                        if (job.last_output) |old| self.allocator.free(old);
+                        job.last_output = self.allocator.dupe(u8, "cron shell command blocked by security policy") catch null;
+                        if (out_bus) |b| {
+                            _ = deliverResult(self.allocator, job.delivery, "cron shell command blocked by security policy", false, b) catch {};
+                        }
+                        continue;
+                    };
+
+                    const result = runShellJob(
+                        self.allocator,
+                        self.shell_cwd,
+                        job.command,
+                        self.shell_timeout_ns,
+                        self.shell_max_output_bytes,
+                    ) catch |err| {
+                        log.err("cron job '{s}' failed to start: {}", .{ job.id, err });
+                        job.last_status = "error";
+                        job.last_run_secs = now;
+                        job.last_output = null;
+                        // Deliver error notification
+                        if (out_bus) |b| {
+                            _ = deliverResult(self.allocator, job.delivery, "cron job failed to start", false, b) catch {};
+                        }
+                        continue;
+                    };
+                    defer self.allocator.free(result.stderr);
+
+                    const success = result.success;
+                    job.last_run_secs = now;
+                    job.last_status = if (success) "ok" else if (result.timed_out) "timeout" else "error";
+
+                    // Store and deliver stdout
+                    if (job.last_output) |old| self.allocator.free(old);
+                    job.last_output = if (result.stdout.len > 0) result.stdout else blk: {
+                        self.allocator.free(result.stdout);
+                        break :blk null;
+                    };
+
+                    if (out_bus) |b| {
+                        const output = job.last_output orelse "";
+                        _ = deliverResult(self.allocator, job.delivery, output, success, b) catch {};
+                    }
+                },
+                .agent => {
+                    const agent_output = job.prompt orelse job.command;
+                    if (builtin.is_test) {
+                        // Keep unit tests deterministic: no subprocess or network side effects.
+                        job.last_run_secs = now;
+                        job.last_status = "ok";
+
+                        if (job.last_output) |old| self.allocator.free(old);
+                        job.last_output = self.allocator.dupe(u8, agent_output) catch null;
+
+                        if (out_bus) |b| {
+                            if (job.session_target == .main) {
+                                _ = deliverViaMainAgent(self.allocator, job.delivery, agent_output, true, b, job.name orelse job.id) catch {};
+                            } else {
+                                _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                            }
+                        }
+                    } else {
+                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs, job.delivery) catch |err| {
+                            log.err("cron agent job '{s}' execution failed: {s}", .{ job.id, @errorName(err) });
+                            job.last_run_secs = now;
+                            job.last_status = "error";
+                            if (job.last_output) |old| self.allocator.free(old);
+                            job.last_output = null;
+                            if (out_bus) |b| {
+                                _ = deliverResult(self.allocator, job.delivery, "agent job execution failed", false, b) catch {};
+                            }
+                            continue;
+                        };
+
+                        job.last_run_secs = now;
+                        job.last_status = if (exec_result.success) "ok" else "error";
+                        if (job.last_output) |old| self.allocator.free(old);
+                        if (out_bus) |b| {
+                            if (job.session_target == .main) {
+                                _ = deliverViaMainAgent(self.allocator, job.delivery, exec_result.output, exec_result.success, b, job.name orelse job.id) catch {};
+                            } else {
+                                _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b) catch {};
+                            }
+                        }
+
+                        job.last_output = if (exec_result.output.len > 0) exec_result.output else blk: {
+                            self.allocator.free(exec_result.output);
+                            break :blk null;
+                        };
+                    }
+                },
+            }
+
+            if (job.one_shot or job.delete_after_run) {
+                remove_indices.append(self.allocator, idx) catch {
+                    // If we can't queue for deletion under memory pressure, prevent reruns.
+                    job.paused = true;
+                };
+            } else {
+                job.next_run_secs = nextRunForCronExpression(job.expression, now) catch |err| blk: {
+                    log.warn("cron job '{s}' schedule parse failed ({s}); fallback to +60s", .{ job.id, @errorName(err) });
+                    break :blk now + 60;
+                };
+            }
+        }
+
+        // Remove one-shot jobs in reverse order to keep indices valid
+        if (remove_indices.items.len > 0) {
+            var i: usize = remove_indices.items.len;
+            while (i > 0) {
+                i -= 1;
+                const rm_idx = remove_indices.items[i];
+                const job = self.jobs.items[rm_idx];
+                self.freeJobOwned(job);
+                _ = self.jobs.orderedRemove(rm_idx);
+            }
+        }
+
+        return changed;
+    }
+};
+
+const agent_runner = @import("agent_runner.zig");
+const AgentRunResult = agent_runner.AgentRunResult;
+
+fn buildSafeShellEnv(allocator: std.mem.Allocator) !std_compat.process.EnvMap {
+    var env = std_compat.process.EnvMap.init(allocator);
+    errdefer env.deinit();
+
+    for (safe_env_vars) |key| {
+        if (platform.getEnvOrNull(allocator, key)) |val| {
+            defer allocator.free(val);
+            try env.put(key, val);
+        }
+    }
+
+    return env;
+}
+
+fn runShellJob(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    command: []const u8,
+    timeout_ns: u64,
+    max_output_bytes: usize,
+) !process_util.RunResult {
+    var env = try buildSafeShellEnv(allocator);
+    defer env.deinit();
+
+    return process_util.run(
+        allocator,
+        &.{ platform.getShell(), platform.getShellFlag(), command },
+        .{
+            .cwd = resolveRunnableCwd(cwd),
+            .env_map = &env,
+            .timeout_ns = timeout_ns,
+            .max_output_bytes = max_output_bytes,
+        },
+    );
+}
+
+fn runAgentJob(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    timeout_secs: u64,
+    delivery: DeliveryConfig,
+) !AgentRunResult {
+    return agent_runner.runWithOptions(allocator, cwd, prompt, model, timeout_secs, agentRunOptionsForDelivery(delivery));
+}
+
+fn agentRunOptionsForDelivery(delivery: DeliveryConfig) agent_runner.AgentRunOptions {
+    return .{
+        .origin_channel = delivery.channel,
+        .origin_account_id = delivery.account_id,
+    };
+}
+
+const LoadPolicy = enum {
+    best_effort,
+    strict,
+};
+
+fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
+    const path = try cronJsonPath(scheduler.allocator);
+    defer scheduler.allocator.free(path);
+
+    const content = fs_compat.readFileAlloc(std_compat.fs.cwd(), scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => switch (policy) {
+            .best_effort => return,
+            .strict => return err,
+        },
+    };
+    defer scheduler.allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, scheduler.allocator, content, .{}) catch |err| switch (policy) {
+        .best_effort => return,
+        .strict => return err,
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .array) switch (policy) {
+        .best_effort => return,
+        .strict => return error.InvalidCronStoreFormat,
+    };
+
+    for (parsed.value.array.items) |item| {
+        if (item != .object) switch (policy) {
+            .best_effort => continue,
+            .strict => return error.InvalidCronStoreFormat,
+        };
+        const obj = item.object;
+
+        const id = blk: {
+            if (obj.get("id")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
+        };
+        const expression = blk: {
+            if (obj.get("expression")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
+        };
+        const command_raw: ?[]const u8 = blk: {
+            if (obj.get("command")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
+
+        const next_run_secs: i64 = blk: {
+            if (obj.get("next_run_secs")) |v| {
+                if (v == .integer) break :blk v.integer;
+            }
+            break :blk std_compat.time.timestamp() + 60;
+        };
+        const last_run_secs: ?i64 = blk: {
+            if (obj.get("last_run_secs")) |v| {
+                if (v == .integer) break :blk v.integer;
+                if (v == .null) break :blk null;
+            }
+            break :blk null;
+        };
+        const last_status = blk: {
+            if (obj.get("last_status")) |v| {
+                if (v == .string and v.string.len > 0) {
+                    if (std.mem.eql(u8, v.string, "ok")) break :blk "ok";
+                    if (std.mem.eql(u8, v.string, "error")) break :blk "error";
+                    // Backward-compat aliases from older payloads.
+                    if (std.mem.eql(u8, v.string, "success")) break :blk "ok";
+                    if (std.mem.eql(u8, v.string, "failed")) break :blk "error";
+                }
+            }
+            break :blk null;
+        };
+
+        const paused = blk: {
+            if (obj.get("paused")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+
+        const one_shot = blk: {
+            if (obj.get("one_shot")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+
+        const job_type = blk: {
+            if (obj.get("job_type")) |v| {
+                if (v == .string) break :blk JobType.parse(v.string);
+            }
+            break :blk JobType.shell;
+        };
+        const prompt_raw: ?[]const u8 = blk: {
+            if (obj.get("prompt")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
+        // Normalize agent job text so prompt/command stay in sync regardless
+        // of which back-compat field was present in cron.json.
+        const prompt: ?[]const u8 = blk: {
+            if (prompt_raw) |p| break :blk p;
+            if (job_type == .agent) break :blk command_raw;
+            break :blk null;
+        };
+        // Agent jobs may omit "command" and rely solely on "prompt".
+        // Shell jobs still require a command.
+        const command: []const u8 = blk: {
+            if (command_raw) |c| break :blk c;
+            if (job_type == .agent) {
+                if (prompt) |p| break :blk p;
+            }
+            switch (policy) {
+                .best_effort => continue,
+                .strict => return error.InvalidCronStoreFormat,
+            }
+        };
+        const model = blk: {
+            if (obj.get("model")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const enabled = blk: {
+            if (obj.get("enabled")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk true;
+        };
+        const delete_after_run = blk: {
+            if (obj.get("delete_after_run")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+
+        // Load delivery config
+        const delivery_mode = blk: {
+            if (obj.get("delivery_mode")) |v| {
+                if (v == .string) {
+                    if (std.mem.eql(u8, v.string, "always")) break :blk DeliveryMode.always;
+                    if (std.mem.eql(u8, v.string, "on_success")) break :blk DeliveryMode.on_success;
+                    if (std.mem.eql(u8, v.string, "on_error")) break :blk DeliveryMode.on_error;
+                    if (std.mem.eql(u8, v.string, "none")) break :blk DeliveryMode.none;
+                }
+            }
+            break :blk DeliveryMode.none;
+        };
+        const delivery_channel = blk: {
+            if (obj.get("delivery_channel")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const delivery_account_id = blk: {
+            if (obj.get("delivery_account_id")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const delivery_to = blk: {
+            if (obj.get("delivery_to")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const delivery_peer_kind = blk: {
+            if (obj.get("delivery_peer_kind")) |v| {
+                if (v == .string) break :blk parseChatType(v.string);
+            }
+            break :blk null;
+        };
+        const delivery_peer_id = blk: {
+            if (obj.get("delivery_peer_id")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const delivery_thread_id = blk: {
+            if (obj.get("delivery_thread_id")) |v| {
+                if (v == .string) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const delivery_best_effort = blk: {
+            if (obj.get("delivery_best_effort")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk true;
+        };
+        const session_target = blk: {
+            if (obj.get("session_target")) |v| {
+                if (v == .string) {
+                    break :blk switch (policy) {
+                        .best_effort => SessionTarget.parse(v.string),
+                        .strict => SessionTarget.parseStrict(v.string) catch return error.InvalidCronStoreFormat,
+                    };
+                }
+            }
+            break :blk SessionTarget.isolated;
+        };
+
+        try scheduler.jobs.append(scheduler.allocator, .{
+            .id = try scheduler.allocator.dupe(u8, id),
+            .expression = try scheduler.allocator.dupe(u8, expression),
+            .command = try scheduler.allocator.dupe(u8, command),
+            .next_run_secs = next_run_secs,
+            .last_run_secs = last_run_secs,
+            .last_status = last_status,
+            .paused = paused,
+            .one_shot = one_shot,
+            .job_type = job_type,
+            .session_target = session_target,
+            .prompt = if (prompt) |p| try scheduler.allocator.dupe(u8, p) else null,
+            .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
+            .enabled = enabled,
+            .delete_after_run = delete_after_run,
+            .delivery = .{
+                .mode = delivery_mode,
+                .channel = if (delivery_channel) |c| try scheduler.allocator.dupe(u8, c) else null,
+                .account_id = if (delivery_account_id) |aid| try scheduler.allocator.dupe(u8, aid) else null,
+                .to = if (delivery_to) |t| try scheduler.allocator.dupe(u8, t) else null,
+                .peer_kind = delivery_peer_kind,
+                .peer_id = if (delivery_peer_id) |peer_id| try scheduler.allocator.dupe(u8, peer_id) else null,
+                .thread_id = if (delivery_thread_id) |thread_id| try scheduler.allocator.dupe(u8, thread_id) else null,
+                .channel_owned = delivery_channel != null,
+                .account_id_owned = delivery_account_id != null,
+                .to_owned = delivery_to != null,
+                .peer_id_owned = delivery_peer_id != null,
+                .thread_id_owned = delivery_thread_id != null,
+                .best_effort = delivery_best_effort,
+            },
+        });
+    }
+}
+
+// ── Delivery ─────────────────────────────────────────────────────
+
+/// Deliver a cron job result to a channel via the outbound bus.
+/// Returns true if a message was published, false if delivery was skipped.
+pub fn deliverResult(
+    allocator: std.mem.Allocator,
+    delivery: DeliveryConfig,
+    output: []const u8,
+    success: bool,
+    out_bus: *bus.Bus,
+) !bool {
+    // Skip if mode is none
+    if (delivery.mode == .none) return false;
+
+    // Skip if no channel configured
+    const channel = delivery.channel orelse return false;
+
+    // Check mode-specific conditions
+    switch (delivery.mode) {
+        .none => return false,
+        .on_success => if (!success) return false,
+        .on_error => if (success) return false,
+        .always => {},
+    }
+
+    // Skip empty output
+    if (output.len == 0) return false;
+
+    const chat_id = delivery.to orelse "default";
+    const msg = if (delivery.account_id) |account_id|
+        try bus.makeOutboundWithAccount(allocator, channel, account_id, chat_id, output)
+    else
+        try bus.makeOutbound(allocator, channel, chat_id, output);
+    out_bus.publishOutbound(msg) catch |err| {
+        // If best_effort, swallow the error after cleaning up
+        if (delivery.best_effort) {
+            msg.deinit(allocator);
+            return false;
+        }
+        msg.deinit(allocator);
+        return err;
+    };
+    return true;
+}
+
+fn buildCronMainAgentSessionKey(
+    allocator: std.mem.Allocator,
+    delivery: DeliveryConfig,
+    channel: []const u8,
+    chat_id: []const u8,
+) ![]const u8 {
+    if (delivery.account_id) |account_id| {
+        return std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ channel, account_id, chat_id });
+    }
+    return std.fmt.allocPrint(allocator, "{s}:{s}", .{ channel, chat_id });
+}
+
+fn buildCronMainAgentMetadata(
+    allocator: std.mem.Allocator,
+    delivery: DeliveryConfig,
+    channel: []const u8,
+    chat_id: []const u8,
+) !?[]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    const peer_kind = delivery.peer_kind orelse blk: {
+        const inferred = enrichDeliveryRouting(.{
+            .channel = channel,
+            .to = chat_id,
+        });
+        break :blk inferred.peer_kind;
+    };
+    const peer_id = delivery.peer_id orelse blk: {
+        const inferred = enrichDeliveryRouting(.{
+            .channel = channel,
+            .to = chat_id,
+        });
+        break :blk inferred.peer_id;
+    };
+    var inferred_thread_buf: [32]u8 = undefined;
+    const thread_id = delivery.thread_id orelse if (std.mem.eql(u8, channel, "telegram"))
+        if (telegram.targetThreadId(chat_id)) |thread|
+            std.fmt.bufPrint(&inferred_thread_buf, "{d}", .{thread}) catch null
+        else
+            null
+    else
+        null;
+
+    var wrote_field = false;
+    try buf.appendSlice(allocator, "{");
+    if (delivery.account_id) |account_id| {
+        try json_util.appendJsonKeyValue(&buf, allocator, "account_id", account_id);
+        wrote_field = true;
+    }
+    if (peer_kind) |kind| {
+        if (wrote_field) try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "peer_kind", chatTypeAsStr(kind));
+        wrote_field = true;
+    }
+    if (peer_id) |value| {
+        if (wrote_field) try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "peer_id", value);
+        wrote_field = true;
+    }
+    if (thread_id) |value| {
+        if (wrote_field) try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "thread_id", value);
+        wrote_field = true;
+    }
+    try buf.appendSlice(allocator, "}");
+
+    if (!wrote_field) {
+        buf.deinit(allocator);
+        return null;
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Route a cron agent result through the main agent session via the inbound bus.
+/// The main agent receives the output as a system message, processes it with its
+/// full context (soul, memory, skills), and delivers a contextualised response.
+pub fn deliverViaMainAgent(
+    allocator: std.mem.Allocator,
+    delivery: DeliveryConfig,
+    output: []const u8,
+    success: bool,
+    the_bus: *bus.Bus,
+    job_name: []const u8,
+) !bool {
+    // Apply the same filtering as deliverResult
+    if (delivery.mode == .none) return false;
+    const channel = delivery.channel orelse return false;
+    switch (delivery.mode) {
+        .none => return false,
+        .on_success => if (!success) return false,
+        .on_error => if (success) return false,
+        .always => {},
+    }
+    if (output.len == 0) return false;
+
+    const status_tag = if (success) "" else " [FAILED]";
+    const content = try std.fmt.allocPrint(
+        allocator,
+        "[Scheduled task '{s}'{s} completed]\n{s}",
+        .{ job_name, status_tag, output },
+    );
+    defer allocator.free(content);
+
+    const chat_id = delivery.to orelse "default";
+    const session_key = try buildCronMainAgentSessionKey(allocator, delivery, channel, chat_id);
+    defer allocator.free(session_key);
+    const metadata_json = try buildCronMainAgentMetadata(allocator, delivery, channel, chat_id);
+    defer if (metadata_json) |value| allocator.free(value);
+
+    const msg = if (metadata_json) |value|
+        try bus.makeInboundFull(allocator, channel, "system:cron", chat_id, content, session_key, &.{}, value)
+    else
+        try bus.makeInbound(allocator, channel, "system:cron", chat_id, content, session_key);
+    the_bus.publishInbound(msg) catch |err| {
+        if (delivery.best_effort) {
+            msg.deinit(allocator);
+            return false;
+        }
+        msg.deinit(allocator);
+        return err;
+    };
+    return true;
+}
+
+// ── JSON Persistence ─────────────────────────────────────────────
+
+/// Serializable representation of a cron job for JSON persistence.
+const JsonCronJob = struct {
+    id: []const u8,
+    expression: []const u8,
+    command: []const u8,
+    next_run_secs: i64,
+    last_run_secs: ?i64,
+    last_status: ?[]const u8,
+    paused: bool,
+    one_shot: bool,
+    // Delivery config for notifications
+    delivery_mode: ?[]const u8 = null,
+    delivery_channel: ?[]const u8 = null,
+    delivery_account_id: ?[]const u8 = null,
+    delivery_to: ?[]const u8 = null,
+};
+
+fn cronJsonPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]const u8 {
+    return config_paths.pathFromConfigDir(allocator, config_dir, "cron.json");
+}
+
+/// Get the cron.json path inside the config directory.
+fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
+    const dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(dir);
+
+    if (builtin.is_test) {
+        const leaf = try std.fmt.allocPrint(allocator, "cron-{d}.json", .{std.Thread.getCurrentId()});
+        defer allocator.free(leaf);
+        return config_paths.pathFromConfigDir(allocator, dir, leaf);
+    }
+
+    return cronJsonPathFromDir(allocator, dir);
+}
+
+/// Ensure the config directory exists.
+fn ensureCronDir(allocator: std.mem.Allocator) !void {
+    const dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(dir);
+    std_compat.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
+fn printStdoutBytes(text: []const u8) void {
+    admin_output.writeStdoutBytes(text) catch return;
+}
+
+fn appendNullableString(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: ?[]const u8,
+) !void {
+    if (value) |text| {
+        try json_util.appendJsonString(buf, allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendNullableInt(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    value: ?i64,
+) !void {
+    if (value) |num| {
+        var int_buf: [24]u8 = undefined;
+        const text = std.fmt.bufPrint(&int_buf, "{d}", .{num}) catch unreachable;
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendCronJobJson(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    job: CronJob,
+) !void {
+    try buf.appendSlice(allocator, "{");
+
+    try json_util.appendJsonKeyValue(buf, allocator, "id", job.id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "expression", job.expression);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "command", job.command);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "next_run_secs", job.next_run_secs);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_run_secs");
+    try appendNullableInt(buf, allocator, job.last_run_secs);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_status");
+    try appendNullableString(buf, allocator, job.last_status);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "paused");
+    try buf.appendSlice(allocator, if (job.paused) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "one_shot");
+    try buf.appendSlice(allocator, if (job.one_shot) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "job_type", job.job_type.asStr());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "prompt");
+    try appendNullableString(buf, allocator, job.prompt);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "model");
+    try appendNullableString(buf, allocator, job.model);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "enabled");
+    try buf.appendSlice(allocator, if (job.enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delete_after_run");
+    try buf.appendSlice(allocator, if (job.delete_after_run) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "session_target", job.session_target.asStr());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_mode");
+    try json_util.appendJsonString(buf, allocator, job.delivery.mode.asStr());
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_channel");
+    try appendNullableString(buf, allocator, job.delivery.channel);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_account_id");
+    try appendNullableString(buf, allocator, job.delivery.account_id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_to");
+    try appendNullableString(buf, allocator, job.delivery.to);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_peer_kind");
+    if (job.delivery.peer_kind) |peer_kind| {
+        try json_util.appendJsonString(buf, allocator, chatTypeAsStr(peer_kind));
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_peer_id");
+    try appendNullableString(buf, allocator, job.delivery.peer_id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_thread_id");
+    try appendNullableString(buf, allocator, job.delivery.thread_id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_best_effort");
+    try buf.appendSlice(allocator, if (job.delivery.best_effort) "true" else "false");
+
+    try buf.appendSlice(allocator, "}");
+}
+
+pub fn buildJobsJson(allocator: std.mem.Allocator, jobs: []const CronJob) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "[\n");
+    for (jobs, 0..) |job, i| {
+        if (i > 0) try buf.appendSlice(allocator, ",\n");
+        try buf.appendSlice(allocator, "  ");
+        try appendCronJobJson(&buf, allocator, job);
+    }
+    try buf.appendSlice(allocator, "\n]\n");
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Save scheduler jobs to cron.json in the config directory.
+pub fn saveJobs(scheduler: *const CronScheduler) !void {
+    try ensureCronDir(scheduler.allocator);
+    const path = try cronJsonPath(scheduler.allocator);
+    defer scheduler.allocator.free(path);
+
+    const body = try buildJobsJson(scheduler.allocator, scheduler.jobs.items);
+    defer scheduler.allocator.free(body);
+
+    try writeFileAtomic(scheduler.allocator, path, body);
+}
+
+/// Load jobs from cron.json in the config directory into the scheduler.
+pub fn loadJobs(scheduler: *CronScheduler) !void {
+    try loadJobsWithPolicy(scheduler, .best_effort);
+}
+
+/// Load jobs from cron.json in the config directory; unlike loadJobs, this returns
+/// parse/read errors (except missing file/path).
+pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
+    try loadJobsWithPolicy(scheduler, .strict);
+}
+
+/// Replace in-memory jobs with the persisted store content.
+pub fn reloadJobs(scheduler: *CronScheduler) !void {
+    var loaded = CronScheduler.init(scheduler.allocator, scheduler.max_tasks, scheduler.enabled);
+    defer loaded.deinit();
+    loadJobsStrict(&loaded) catch |err| {
+        if (isRecoverableCronStoreError(err)) {
+            // Heal malformed/truncated cron.json by persisting current in-memory jobs.
+            // This prevents endless reload warnings after upgrades or interrupted writes.
+            try saveJobs(scheduler);
+            return;
+        }
+        return err;
+    };
+    std.mem.swap(std.ArrayListUnmanaged(CronJob), &scheduler.jobs, &loaded.jobs);
+}
+
+fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+
+    const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
+    errdefer tmp_file.close();
+    try tmp_file.writeAll(data);
+    tmp_file.close();
+
+    std_compat.fs.renameAbsolute(tmp_path, path) catch {
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
+        defer file.close();
+        try file.writeAll(data);
+    };
+}
+
+fn isRecoverableCronStoreError(err: anyerror) bool {
+    return switch (err) {
+        error.UnexpectedEndOfInput,
+        error.SyntaxError,
+        error.InvalidCronStoreFormat,
+        => true,
+        else => false,
+    };
+}
+
+// ── CLI entry points (called from main.zig) ──────────────────────
+
+const http_util = @import("http_util.zig");
+
+pub const GatewayRequest = union(enum) {
+    unavailable,
+    response: http_util.HttpResponse,
+};
+
+fn trimOwnedRight(allocator: std.mem.Allocator, raw: []u8) ?[]u8 {
+    const trimmed = std_compat.mem.trimRight(u8, raw, " \t\r\n");
+    if (trimmed.len == raw.len) return raw;
+
+    const owned = allocator.dupe(u8, trimmed) catch {
+        allocator.free(raw);
+        return null;
+    };
+    allocator.free(raw);
+    return owned;
+}
+
+/// Try to read the gateway URL from daemon_state.json in the config directory.
+/// Returns an allocated string like "http://127.0.0.1:3000" or null.
+fn readGatewayUrl(allocator: std.mem.Allocator) ?[]const u8 {
+    const dir = config_paths.defaultConfigDir(allocator) catch return null;
+    defer allocator.free(dir);
+    const state_path = config_paths.pathFromConfigDir(allocator, dir, "daemon_state.json") catch return null;
+    defer allocator.free(state_path);
+
+    const content = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, state_path, 64 * 1024) catch return null;
+    defer allocator.free(content);
+
+    // Parse "gateway": "host:port" field
+    const key = "\"gateway\":";
+    const key_pos = std.mem.indexOf(u8, content, key) orelse return null;
+    const after_key = content[key_pos + key.len ..];
+    var i: usize = 0;
+    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == '\t')) : (i += 1) {}
+    if (i >= after_key.len or after_key[i] != '"') return null;
+    i += 1; // skip opening quote
+    const val_start = i;
+    while (i < after_key.len and after_key[i] != '"') : (i += 1) {}
+    if (i >= after_key.len) return null;
+    const host_port = after_key[val_start..i];
+    if (host_port.len == 0) return null;
+    return std.fmt.allocPrint(allocator, "http://{s}", .{host_port}) catch null;
+}
+
+/// Read the paired bearer token from paired_token in the config directory (if present).
+/// Resolves the config dir from NULLCLAW_HOME / $HOME/.nullclaw, then delegates to
+/// readPairedTokenFromDir which transparently decrypts enc2: blobs.
+fn readPairedToken(allocator: std.mem.Allocator) ?[]const u8 {
+    const dir = config_paths.defaultConfigDir(allocator) catch return null;
+    defer allocator.free(dir);
+    return readPairedTokenFromDir(allocator, dir);
+}
+
+/// Read + decrypt the paired token from <config_dir>/paired_token.
+///
+/// Returns null when the file is absent or empty/whitespace. Legacy plaintext
+/// tokens (no `enc2:` prefix) pass through unchanged for backward compatibility.
+/// A tampered or undecryptable blob also returns null (graceful degradation)
+/// rather than propagating the crypto error to the cron caller — the gateway
+/// will simply reject the unauthenticated request as before.
+pub fn readPairedTokenFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ?[]const u8 {
+    const token_path = config_paths.pathFromConfigDir(allocator, config_dir, "paired_token") catch return null;
+    defer allocator.free(token_path);
+    const file = fs_compat.openPath(token_path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch |err| {
+        if (err != error.FileNotFound) {
+            log.warn("failed to open paired cron token: {s}", .{@errorName(err)});
+        }
+        return null;
+    };
+    defer file.close();
+    const metadata = file.stat() catch |err| {
+        log.warn("failed to inspect paired cron token: {s}", .{@errorName(err)});
+        return null;
+    };
+    if (metadata.kind != .file) {
+        log.warn("paired cron token is not a regular file", .{});
+        return null;
+    }
+    var raw_buf: [8192]u8 = undefined;
+    if (metadata.size > raw_buf.len) {
+        log.warn("paired cron token exceeds size limit", .{});
+        return null;
+    }
+    // no-follow handles are asynchronous on Windows in Zig 0.16, so they
+    // must be read positionally rather than through readStreaming.
+    const raw_len = file.readAllPositional(&raw_buf) catch |err| {
+        log.warn("failed to read paired cron token: {s}", .{@errorName(err)});
+        return null;
+    };
+    const raw = allocator.dupe(u8, raw_buf[0..raw_len]) catch return null;
+    const trimmed = trimOwnedRight(allocator, raw) orelse return null;
+    // decryptSecret always returns a freshly-allocated buffer: it dupes
+    // plaintext values and dupes the decrypted plaintext for enc2: blobs.
+    const decrypted = secrets.SecretStore.init(config_dir, true)
+        .decryptSecret(allocator, trimmed) catch |err| {
+        allocator.free(trimmed);
+        log.warn("failed to decrypt paired cron token: {s}", .{@errorName(err)});
+        return null;
+    };
+    allocator.free(trimmed);
+    if (decrypted.len == 0) {
+        allocator.free(decrypted);
+        return null;
+    }
+    return decrypted;
+}
+
+/// Persist a cron-scoped bearer to <config_dir>/paired_token. New
+/// credentials are always encrypted; plaintext is accepted only by the reader
+/// for compatibility with operator-managed legacy files.
+pub fn persistPairedToken(
+    allocator: std.mem.Allocator,
+    config_dir: []const u8,
+    token: []const u8,
+) !void {
+    const store = secrets.SecretStore.init(config_dir, true);
+    const blob = try store.encryptSecret(allocator, token);
+    defer allocator.free(blob);
+
+    const token_path = try config_paths.pathFromConfigDir(allocator, config_dir, "paired_token");
+    defer allocator.free(token_path);
+    fs_compat.writeFileAtomicSecure(token_path, blob) catch return error.PairedTokenWriteFailed;
+    log.info("persisted encrypted cron-scoped token", .{});
+}
+
+/// Build Authorization header slice (caller owns via arena/allocator).
+fn buildAuthHeader(allocator: std.mem.Allocator, token: ?[]const u8) ?[]const u8 {
+    const t = token orelse return null;
+    return std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{t}) catch null;
+}
+
+pub fn requestGatewayGet(allocator: std.mem.Allocator, path: []const u8) GatewayRequest {
+    if (builtin.is_test) return .unavailable;
+
+    const base_url = readGatewayUrl(allocator) orelse return .unavailable;
+    defer allocator.free(base_url);
+
+    const token = readPairedToken(allocator);
+    defer if (token) |t| allocator.free(t);
+    const auth_hdr = buildAuthHeader(allocator, token);
+    defer if (auth_hdr) |h| allocator.free(h);
+
+    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path }) catch return .unavailable;
+    defer allocator.free(url);
+
+    const headers: []const []const u8 = if (auth_hdr) |h| &.{h} else &.{};
+    const resp = http_util.curlGetWithStatusAndTimeout(allocator, url, headers, "5") catch return .unavailable;
+    if (resp.status_code == 0) {
+        allocator.free(resp.body);
+        return .unavailable;
+    }
+    return .{ .response = resp };
+}
+
+pub fn requestGatewayPost(allocator: std.mem.Allocator, path: []const u8, json_body: []const u8) GatewayRequest {
+    if (builtin.is_test) return .unavailable;
+
+    const base_url = readGatewayUrl(allocator) orelse return .unavailable;
+    defer allocator.free(base_url);
+
+    const token = readPairedToken(allocator);
+    defer if (token) |t| allocator.free(t);
+    const auth_hdr = buildAuthHeader(allocator, token);
+    defer if (auth_hdr) |h| allocator.free(h);
+
+    const url = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_url, path }) catch return .unavailable;
+    defer allocator.free(url);
+
+    const headers: []const []const u8 = if (auth_hdr) |h| &.{h} else &.{};
+    // Match gateway GET behavior: if the live gateway accepts the TCP connection
+    // but never responds, cron CLI should fall back to local cron.json instead of
+    // hanging the caller indefinitely.
+    const resp = http_util.curlPostWithStatusAndTimeout(allocator, url, json_body, headers, "2") catch return .unavailable;
+    if (resp.status_code == 0) {
+        allocator.free(resp.body);
+        return .unavailable;
+    }
+    return .{ .response = resp };
+}
+
+/// Issue an HTTP GET to the live gateway and print the JSON response.
+/// Returns true on success (2xx), false if gateway not reachable or non-2xx.
+fn gatewayGet(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8) bool {
+    _ = base_url;
+    switch (requestGatewayGet(allocator, path)) {
+        .unavailable => return false,
+        .response => |resp| {
+            defer allocator.free(resp.body);
+            log.info("{s}", .{resp.body});
+            return resp.status_code >= 200 and resp.status_code < 300;
+        },
+    }
+}
+
+/// Issue an HTTP POST to the live gateway with a JSON body.
+/// Returns true on success (2xx).
+fn gatewayPost(allocator: std.mem.Allocator, base_url: []const u8, path: []const u8, json_body: []const u8) bool {
+    _ = base_url;
+    switch (requestGatewayPost(allocator, path, json_body)) {
+        .unavailable => return false,
+        .response => |resp| {
+            defer allocator.free(resp.body);
+            log.info("{s}", .{resp.body});
+            return resp.status_code >= 200 and resp.status_code < 300;
+        },
+    }
+}
+
+const SchedulerStatus = struct {
+    config_exists: bool,
+    scheduler_enabled: bool,
+    daemon_state_present: bool,
+    config_probe_error: ?[]const u8 = null,
+};
+
+fn schedulerStatusCode(sched_status: SchedulerStatus) []const u8 {
+    if (sched_status.config_probe_error != null) return "error";
+    if (!sched_status.config_exists) return "not_configured";
+    if (!sched_status.scheduler_enabled) return "disabled";
+    if (!sched_status.daemon_state_present) return "waiting_for_daemon";
+    return "ok";
+}
+
+fn buildSchedulerStatusJson(
+    allocator: std.mem.Allocator,
+    sched_status: SchedulerStatus,
+    job_count: usize,
+    active_count: usize,
+    paused_count: usize,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(&buf, allocator, "status", schedulerStatusCode(sched_status));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "config_exists");
+    try buf.appendSlice(allocator, if (sched_status.config_exists) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "scheduler_enabled");
+    try buf.appendSlice(allocator, if (sched_status.scheduler_enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "daemon_state_present");
+    try buf.appendSlice(allocator, if (sched_status.daemon_state_present) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "job_count", @intCast(job_count));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "active_jobs", @intCast(active_count));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "paused_jobs", @intCast(paused_count));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "config_probe_error");
+    try appendNullableString(&buf, allocator, sched_status.config_probe_error);
+    try buf.appendSlice(allocator, "}");
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn absolutePathExists(path: []const u8) bool {
+    std_compat.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+fn probeSchedulerStatus(config_path: []const u8, daemon_state_path: []const u8, scheduler_enabled: bool) SchedulerStatus {
+    return .{
+        .config_exists = absolutePathExists(config_path),
+        .scheduler_enabled = scheduler_enabled,
+        .daemon_state_present = absolutePathExists(daemon_state_path),
+    };
+}
+
+/// CLI: list all cron jobs.
+fn checkSchedulerStatus(allocator: std.mem.Allocator) SchedulerStatus {
+    var config_opt = @import("config.zig").Config.load(allocator) catch |err| {
+        return .{
+            .config_exists = false,
+            .scheduler_enabled = false,
+            .daemon_state_present = false,
+            .config_probe_error = @errorName(err),
+        };
+    };
+    defer config_opt.deinit();
+
+    const daemon_state_path = @import("daemon.zig").stateFilePath(allocator, &config_opt) catch {
+        return .{
+            .config_exists = absolutePathExists(config_opt.config_path),
+            .scheduler_enabled = config_opt.scheduler.enabled,
+            .daemon_state_present = false,
+        };
+    };
+    defer allocator.free(daemon_state_path);
+
+    return probeSchedulerStatus(config_opt.config_path, daemon_state_path, config_opt.scheduler.enabled);
+}
+
+pub fn cliListJobs(allocator: std.mem.Allocator, as_json: bool) !void {
+    // If the gateway is running, query it directly instead of reading from disk.
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        switch (requestGatewayGet(allocator, "/cron")) {
+            .unavailable => {},
+            .response => |resp| {
+                defer allocator.free(resp.body);
+                if (resp.status_code >= 200 and resp.status_code < 300) {
+                    if (as_json) {
+                        printStdoutBytes(resp.body);
+                        if (resp.body.len == 0 or resp.body[resp.body.len - 1] != '\n') {
+                            printStdoutBytes("\n");
+                        }
+                    } else {
+                        log.info("{s}", .{resp.body});
+                    }
+                    return;
+                }
+            },
+        }
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const jobs = scheduler.listJobs();
+    if (as_json) {
+        const jobs_json = try buildJobsJson(allocator, jobs);
+        defer allocator.free(jobs_json);
+        printStdoutBytes(jobs_json);
+        return;
+    }
+
+    // Check scheduler status and warn user if needed.
+    const sched_status = checkSchedulerStatus(allocator);
+    if (sched_status.config_probe_error) |err_name| {
+        log.warn("Cannot inspect scheduler config: {s}", .{err_name});
+    } else if (!sched_status.config_exists) {
+        log.warn("Config file not found. Run `nullclaw onboard` first.", .{});
+    } else if (!sched_status.scheduler_enabled) {
+        log.warn("Cron scheduler is DISABLED in config. Jobs will not run automatically.", .{});
+        log.warn("Enable with: scheduler.enabled = true in config, then restart daemon.", .{});
+    } else if (!sched_status.daemon_state_present) {
+        log.warn("Daemon state file not found. Cron jobs will not run until the daemon starts.", .{});
+        log.warn("Start with: nullclaw gateway or nullclaw service start", .{});
+    }
+
+    if (jobs.len == 0) {
+        log.info("No scheduled tasks yet.", .{});
+        log.info("Usage:", .{});
+        log.info("  nullclaw cron add '*/10 * * * *' 'echo hello'", .{});
+        log.info("  nullclaw cron once 30m 'echo reminder'", .{});
+        if (sched_status.config_exists and sched_status.scheduler_enabled and sched_status.daemon_state_present) {
+            log.info("Scheduler is configured and has written a state file.", .{});
+            log.info("Run `nullclaw doctor` to verify live daemon health.", .{});
+        }
+        return;
+    }
+
+    log.info("Scheduled jobs ({d}):", .{jobs.len});
+    for (jobs) |job| {
+        const flags: []const u8 = blk: {
+            if (job.paused and job.one_shot) break :blk " [paused, one-shot]";
+            if (job.paused) break :blk " [paused]";
+            if (job.one_shot) break :blk " [one-shot]";
+            break :blk "";
+        };
+        const status = job.last_status orelse "n/a";
+        log.info("- {s} | {s} | type={s} | next={d} | status={s}{s} cmd: {s}", .{
+            job.id,
+            job.expression,
+            job.job_type.asStr(),
+            job.next_run_secs,
+            status,
+            flags,
+            job.command,
+        });
+    }
+}
+
+/// CLI: show scheduler daemon status and diagnostics.
+pub fn cliStatus(allocator: std.mem.Allocator, as_json: bool) !void {
+    const sched_status = checkSchedulerStatus(allocator);
+
+    if (sched_status.config_probe_error != null and as_json) {
+        const json = try buildSchedulerStatusJson(allocator, sched_status, 0, 0, 0);
+        defer allocator.free(json);
+        printStdoutBytes(json);
+        printStdoutBytes("\n");
+        return;
+    }
+
+    if (sched_status.config_probe_error) |err_name| {
+        if (as_json) unreachable;
+        log.info("Cron Scheduler Status:", .{});
+        log.info("  Config probe:      error ({s})", .{err_name});
+        return;
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+    const jobs = scheduler.listJobs();
+
+    var enabled_count: usize = 0;
+    var paused_count: usize = 0;
+    for (jobs) |job| {
+        if (job.paused) {
+            paused_count += 1;
+        } else {
+            enabled_count += 1;
+        }
+    }
+
+    if (as_json) {
+        const json = try buildSchedulerStatusJson(allocator, sched_status, jobs.len, enabled_count, paused_count);
+        defer allocator.free(json);
+        printStdoutBytes(json);
+        printStdoutBytes("\n");
+        return;
+    }
+
+    log.info("Cron Scheduler Status:", .{});
+    log.info("  Config file:       {s}", .{if (sched_status.config_exists) "present" else "missing"});
+    log.info("  Scheduler enabled: {s}", .{if (sched_status.scheduler_enabled) "yes" else "no"});
+    log.info("  Daemon state file: {s}", .{if (sched_status.daemon_state_present) "present" else "missing"});
+
+    if (!sched_status.config_exists) {
+        log.info("  Status: missing configuration; run `nullclaw onboard` first", .{});
+    } else if (!sched_status.scheduler_enabled) {
+        log.info("  Status: scheduler disabled in config", .{});
+        log.info("  Fix: Set scheduler.enabled = true in config, then restart", .{});
+    } else if (!sched_status.daemon_state_present) {
+        log.info("  Status: no daemon state file found yet", .{});
+        log.info("  Fix: Start daemon with `nullclaw gateway` or `nullclaw service start`", .{});
+    } else {
+        log.info("  Status: configured; run `nullclaw doctor` for live daemon health", .{});
+    }
+
+    log.info("  Jobs loaded: {d} total", .{jobs.len});
+    if (jobs.len > 0) {
+        log.info("    - {d} active, {d} paused", .{ enabled_count, paused_count });
+    }
+}
+
+/// Build the shared `/cron/add` request body used by CLI and tool callers.
+pub fn buildGatewayAddBody(
+    allocator: std.mem.Allocator,
+    expression: ?[]const u8,
+    delay: ?[]const u8,
+    command: ?[]const u8,
+    prompt: ?[]const u8,
+    model: ?[]const u8,
+    delivery: ?DeliveryConfig,
+    session_target: ?SessionTarget,
+) ![]u8 {
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_buf.deinit(allocator);
+
+    try body_buf.appendSlice(allocator, "{");
+    var wrote_field = false;
+
+    if (expression) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "expression", value);
+    if (delay) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delay", value);
+    if (command) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "command", value);
+    if (prompt) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "prompt", value);
+    if (model) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "model", value);
+    if (session_target) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "session_target", value.asStr());
+
+    if (delivery) |cfg| {
+        // Keep gateway and local fallback semantics identical even when routing
+        // fields are supplied without --announce.
+        try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_mode", cfg.mode.asStr());
+        if (cfg.channel) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_channel", value);
+        if (cfg.account_id) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_account_id", value);
+        if (cfg.to) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_to", value);
+        if (cfg.peer_kind) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_peer_kind", chatTypeAsStr(value));
+        if (cfg.peer_id) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_peer_id", value);
+        if (cfg.thread_id) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_thread_id", value);
+        if (!cfg.best_effort) try appendGatewayBodyLiteral(&body_buf, allocator, &wrote_field, "\"delivery_best_effort\":false");
+    }
+
+    try body_buf.appendSlice(allocator, "}");
+    return try body_buf.toOwnedSlice(allocator);
+}
+
+fn appendGatewayBodyField(
+    body_buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    wrote_field: *bool,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (wrote_field.*) try body_buf.appendSlice(allocator, ",");
+    wrote_field.* = true;
+    try json_util.appendJsonKeyValue(body_buf, allocator, key, value);
+}
+
+fn appendGatewayBodyLiteral(
+    body_buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    wrote_field: *bool,
+    literal: []const u8,
+) !void {
+    if (wrote_field.*) try body_buf.appendSlice(allocator, ",");
+    wrote_field.* = true;
+    try body_buf.appendSlice(allocator, literal);
+}
+
+/// CLI: add a recurring cron job.
+pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: []const u8) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        const body = buildGatewayAddBody(allocator, expression, null, command, null, null, null, null) catch null;
+        if (body) |json_body| {
+            defer allocator.free(json_body);
+            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+        }
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const job = try scheduler.addJob(expression, command);
+    try saveJobs(&scheduler);
+
+    log.info("Added cron job {s}", .{job.id});
+    log.info("  Expr: {s}", .{job.expression});
+    log.info("  Next: {d}", .{job.next_run_secs});
+    log.info("  Cmd : {s}", .{job.command});
+}
+
+/// CLI: add a recurring agent job.
+pub fn cliAddAgentJob(
+    allocator: std.mem.Allocator,
+    expression: []const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    session_target: SessionTarget,
+    delivery: DeliveryConfig,
+) !void {
+    const enriched_delivery = enrichDeliveryRouting(delivery);
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        const body = buildGatewayAddBody(
+            allocator,
+            expression,
+            null,
+            null,
+            prompt,
+            model,
+            enriched_delivery,
+            if (session_target == .isolated) null else session_target,
+        ) catch null;
+        if (body) |json_body| {
+            defer allocator.free(json_body);
+            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+        }
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const job = try scheduler.addAgentJob(expression, prompt, model, enriched_delivery);
+    job.session_target = session_target;
+    try saveJobs(&scheduler);
+
+    log.info("Added agent cron job {s}", .{job.id});
+    log.info("  Expr : {s}", .{job.expression});
+    log.info("  Type : {s}", .{job.job_type.asStr()});
+    if (job.model) |m| log.info("  Model: {s}", .{m});
+}
+
+/// CLI: add a one-shot delayed task.
+pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []const u8) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        const body = buildGatewayAddBody(allocator, null, delay, command, null, null, null, null) catch null;
+        if (body) |json_body| {
+            defer allocator.free(json_body);
+            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+        }
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const job = try scheduler.addOnce(delay, command);
+    try saveJobs(&scheduler);
+
+    log.info("Added one-shot task {s}", .{job.id});
+    log.info("  Runs at: {d}", .{job.next_run_secs});
+    log.info("  Cmd    : {s}", .{job.command});
+}
+
+/// CLI: add a one-shot delayed agent task.
+pub fn cliAddAgentOnce(
+    allocator: std.mem.Allocator,
+    delay: []const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    session_target: SessionTarget,
+    delivery: DeliveryConfig,
+) !void {
+    const enriched_delivery = enrichDeliveryRouting(delivery);
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        const body = buildGatewayAddBody(
+            allocator,
+            null,
+            delay,
+            null,
+            prompt,
+            model,
+            enriched_delivery,
+            if (session_target == .isolated) null else session_target,
+        ) catch null;
+        if (body) |json_body| {
+            defer allocator.free(json_body);
+            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+        }
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const job = try scheduler.addAgentOnce(delay, prompt, model, enriched_delivery);
+    job.session_target = session_target;
+    try saveJobs(&scheduler);
+
+    log.info("Added one-shot agent task {s}", .{job.id});
+    log.info("  Runs at: {d}", .{job.next_run_secs});
+    log.info("  Type   : {s}", .{job.job_type.asStr()});
+    if (job.model) |m| log.info("  Model  : {s}", .{m});
+}
+
+/// CLI: remove a cron job by ID.
+pub fn cliRemoveJob(allocator: std.mem.Allocator, id: []const u8) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        body_buf.appendSlice(allocator, "{") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
+        body_buf.appendSlice(allocator, "}") catch {};
+        if (gatewayPost(allocator, url, "/cron/remove", body_buf.items)) return;
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    if (scheduler.removeJob(id)) {
+        try saveJobs(&scheduler);
+        log.info("Removed cron job {s}", .{id});
+    } else {
+        log.warn("Cron job '{s}' not found", .{id});
+    }
+}
+
+/// CLI: pause a cron job by ID.
+pub fn cliPauseJob(allocator: std.mem.Allocator, id: []const u8) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        body_buf.appendSlice(allocator, "{") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
+        body_buf.appendSlice(allocator, "}") catch {};
+        if (gatewayPost(allocator, url, "/cron/pause", body_buf.items)) return;
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    if (scheduler.pauseJob(id)) {
+        try saveJobs(&scheduler);
+        log.info("Paused job {s}", .{id});
+    } else {
+        log.warn("Cron job '{s}' not found", .{id});
+    }
+}
+
+/// CLI: resume a paused cron job by ID.
+pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        body_buf.appendSlice(allocator, "{") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
+        body_buf.appendSlice(allocator, "}") catch {};
+        if (gatewayPost(allocator, url, "/cron/resume", body_buf.items)) return;
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    if (scheduler.resumeJob(id)) {
+        try saveJobs(&scheduler);
+        log.info("Resumed job {s}", .{id});
+    } else {
+        log.warn("Cron job '{s}' not found", .{id});
+    }
+}
+
+fn resolveRunnableCwd(cwd_opt: ?[]const u8) ?[]const u8 {
+    const cwd = cwd_opt orelse return null;
+    if (cwd.len == 0) return null;
+
+    if (std_compat.fs.path.isAbsolute(cwd)) {
+        std_compat.fs.accessAbsolute(cwd, .{}) catch return null;
+    } else {
+        fs_compat.accessPath(cwd, .{}) catch return null;
+    }
+    return cwd;
+}
+
+pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
+    var cfg_opt: ?Config = Config.load(allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    if (cfg_opt) |cfg| {
+        scheduler.setShellCwd(cfg.workspace_dir);
+        scheduler.setAgentTimeoutSecs(cfg.scheduler.agent_timeout_secs);
+    }
+    try loadJobs(&scheduler);
+    const run_cwd = resolveRunnableCwd(scheduler.shell_cwd);
+    if (scheduler.shell_cwd != null and run_cwd == null) {
+        log.warn("Cron shell cwd is unavailable; falling back to process cwd for manual run.", .{});
+    }
+
+    if (scheduler.getMutableJob(id)) |job| {
+        log.info("Running job '{s}': {s}", .{ id, job.command });
+        const run_at = std_compat.time.timestamp();
+        switch (job.job_type) {
+            .shell => {
+                scheduler.validateShellCommand(job.command) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    try saveJobs(&scheduler);
+                    log.err("Job '{s}' blocked by security policy: {s}", .{ id, @errorName(err) });
+                    return;
+                };
+
+                const result = runShellJob(
+                    allocator,
+                    run_cwd,
+                    job.command,
+                    scheduler.shell_timeout_ns,
+                    scheduler.shell_max_output_bytes,
+                ) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    try saveJobs(&scheduler);
+                    log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
+                    return;
+                };
+                defer result.deinit(allocator);
+                if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
+                job.last_run_secs = run_at;
+                job.last_status = if (result.success) "ok" else if (result.timed_out) "timeout" else "error";
+                try saveJobs(&scheduler);
+                if (result.success) {
+                    log.info("Job '{s}' completed.", .{id});
+                } else {
+                    log.err("Job '{s}' failed.", .{id});
+                }
+            },
+            .agent => {
+                const prompt = job.prompt orelse job.command;
+                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs, job.delivery) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    try saveJobs(&scheduler);
+                    log.err("Agent job '{s}' failed: {s}", .{ id, @errorName(err) });
+                    return;
+                };
+                defer allocator.free(result.output);
+                if (result.output.len > 0) log.info("{s}", .{result.output});
+                job.last_run_secs = run_at;
+                job.last_status = if (result.success) "ok" else "error";
+                try saveJobs(&scheduler);
+                log.info("Agent job '{s}' completed ({s}).", .{ id, if (result.success) "ok" else "error" });
+            },
+        }
+    } else {
+        log.warn("Cron job '{s}' not found", .{id});
+    }
+}
+
+/// CLI: update a cron job's expression, command, or enabled state.
+pub fn cliUpdateJob(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    expression: ?[]const u8,
+    command: ?[]const u8,
+    prompt: ?[]const u8,
+    model: ?[]const u8,
+    enabled: ?bool,
+    session_target: ?SessionTarget,
+) !void {
+    if (readGatewayUrl(allocator)) |url| {
+        defer allocator.free(url);
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_buf.deinit(allocator);
+        body_buf.appendSlice(allocator, "{") catch {};
+        json_util.appendJsonKeyValue(&body_buf, allocator, "id", id) catch {};
+        if (expression) |e| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "expression", e) catch {};
+        }
+        if (command) |c| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "command", c) catch {};
+        }
+        if (prompt) |p| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "prompt", p) catch {};
+        }
+        if (model) |m| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "model", m) catch {};
+        }
+        if (enabled) |ena| {
+            body_buf.appendSlice(allocator, ",\"enabled\":") catch {};
+            body_buf.appendSlice(allocator, if (ena) "true" else "false") catch {};
+        }
+        if (session_target) |value| {
+            body_buf.appendSlice(allocator, ",") catch {};
+            json_util.appendJsonKeyValue(&body_buf, allocator, "session_target", value.asStr()) catch {};
+        }
+        body_buf.appendSlice(allocator, "}") catch {};
+        if (gatewayPost(allocator, url, "/cron/update", body_buf.items)) return;
+    }
+
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    if (session_target != null) {
+        const existing = scheduler.getJob(id) orelse {
+            log.warn("Cron job '{s}' not found", .{id});
+            return;
+        };
+        if (existing.job_type != .agent) return error.SessionTargetRequiresAgentJob;
+    }
+
+    const patch = CronJobPatch{
+        .expression = expression,
+        .command = command,
+        .prompt = prompt,
+        .model = model,
+        .enabled = enabled,
+        .session_target = session_target,
+    };
+    if (scheduler.updateJob(allocator, id, patch)) {
+        try saveJobs(&scheduler);
+        log.info("Updated job {s}", .{id});
+    } else {
+        log.warn("Cron job '{s}' not found", .{id});
+    }
+}
+
+/// CLI: list run history for a cron job.
+pub fn cliListRuns(allocator: std.mem.Allocator, id: []const u8) !void {
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    if (scheduler.getJob(id)) |job| {
+        log.info("Run history for job {s} ({s}):", .{ id, job.command });
+        const status = job.last_status orelse "never run";
+        log.info("  Last status: {s}", .{status});
+        var ts_buf: [64]u8 = undefined;
+        const formatted = formatUnixTimestamp(job.next_run_secs, &ts_buf);
+        log.info("  Next run:    {d} ({s})", .{ job.next_run_secs, formatted });
+    } else {
+        log.warn("Cron job '{s}' not found", .{id});
+    }
+}
+
+/// Format a Unix timestamp (seconds since epoch) into a human-readable string.
+/// Returns: "Mon Mar 02 2026 12:39:00 UTC"
+fn formatUnixTimestamp(secs: i64, buf: []u8) []const u8 {
+    const min_formatted_len = "Thu Jan 01 1970 00:00:00 UTC".len;
+    if (buf.len < min_formatted_len) return "buffer too small";
+    if (secs < 0) return "invalid timestamp";
+
+    const epoch_secs = std.time.epoch.EpochSeconds{ .secs = @intCast(secs) };
+    const epoch_day = epoch_secs.getEpochDay();
+    const day_seconds = epoch_secs.getDaySeconds();
+
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    // Jan 1, 1970 was Thursday (day 0 = Thu, day 4 = Mon, etc.)
+    // Formula: (epoch_day.day + 4) % 7 gives us an index into the weekday array
+    const weekday_num = @as(u3, @intCast((epoch_day.day + 4) % 7));
+    const weekday_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    const hour = day_seconds.getHoursIntoDay();
+    const minute = day_seconds.getMinutesIntoHour();
+    const second = day_seconds.getSecondsIntoMinute();
+
+    const month_num = month_day.month.numeric();
+    const month_index = if (month_num > 0 and month_num <= 12) month_num - 1 else 0;
+    const month_name = month_names[month_index];
+
+    const len = std.fmt.bufPrint(buf, "{s} {s} {d:0>2} {d} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{
+        weekday_names[weekday_num],
+        month_name,
+        month_day.day_index + 1,
+        year_day.year,
+        hour,
+        minute,
+        second,
+    }) catch return "format error";
+
+    return buf[0..len.len];
+}
+
+// ── Backwards-compatible type alias ──────────────────────────────────
+
+pub const Task = CronJob;
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+var cron_store_test_mutex: std_compat.sync.Mutex = .{};
+
+fn resetCronStoreForTest(allocator: std.mem.Allocator) !void {
+    const path = try cronJsonPath(allocator);
+    defer allocator.free(path);
+
+    std_compat.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    std_compat.fs.deleteFileAbsolute(tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+test "parseDuration minutes" {
+    try std.testing.expectEqual(@as(i64, 1800), try parseDuration("30m"));
+}
+
+test "parseDuration hours" {
+    try std.testing.expectEqual(@as(i64, 7200), try parseDuration("2h"));
+}
+
+test "parseDuration days" {
+    try std.testing.expectEqual(@as(i64, 86400), try parseDuration("1d"));
+}
+
+test "parseDuration weeks" {
+    try std.testing.expectEqual(@as(i64, 604800), try parseDuration("1w"));
+}
+
+test "formatUnixTimestamp formats known UTC timestamp" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Mon Mar 02 2026 14:00:00 UTC",
+        formatUnixTimestamp(1772460000, &buf),
+    );
+}
+
+test "formatUnixTimestamp formats unix epoch" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Thu Jan 01 1970 00:00:00 UTC",
+        formatUnixTimestamp(0, &buf),
+    );
+}
+
+test "formatUnixTimestamp rejects negative timestamp" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("invalid timestamp", formatUnixTimestamp(-1, &buf));
+}
+
+test "formatUnixTimestamp accepts exact-size buffer" {
+    var buf: [28]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Thu Jan 01 1970 00:00:00 UTC",
+        formatUnixTimestamp(0, &buf),
+    );
+}
+
+test "formatUnixTimestamp rejects undersized buffer" {
+    var buf: [27]u8 = undefined;
+    try std.testing.expectEqualStrings("buffer too small", formatUnixTimestamp(0, &buf));
+}
+
+test "parseDuration seconds" {
+    try std.testing.expectEqual(@as(i64, 30), try parseDuration("30s"));
+}
+
+test "parseDuration default unit is minutes" {
+    try std.testing.expectEqual(@as(i64, 300), try parseDuration("5"));
+}
+
+test "parseDuration empty returns error" {
+    try std.testing.expectError(error.EmptyDelay, parseDuration(""));
+}
+
+test "parseDuration unknown unit" {
+    try std.testing.expectError(error.UnknownDurationUnit, parseDuration("5x"));
+}
+
+test "normalizeExpression 5 fields" {
+    const result = try normalizeExpression("*/5 * * * *");
+    try std.testing.expect(result.needs_second_prefix);
+}
+
+test "normalizeExpression 6 fields" {
+    const result = try normalizeExpression("0 */5 * * * *");
+    try std.testing.expect(!result.needs_second_prefix);
+}
+
+test "normalizeExpression 4 fields invalid" {
+    try std.testing.expectError(error.InvalidCronExpression, normalizeExpression("* * * *"));
+}
+
+test "nextRunForCronExpression supports step minutes" {
+    try std.testing.expectEqual(@as(i64, 300), try nextRunForCronExpression("*/5 * * * *", 0));
+}
+
+test "nextRunForCronExpression supports anchored step minutes" {
+    try std.testing.expectEqual(@as(i64, 480), try nextRunForCronExpression("8/25 * * * *", 0));
+    try std.testing.expectEqual(@as(i64, 1980), try nextRunForCronExpression("8/25 * * * *", 480));
+    try std.testing.expectEqual(@as(i64, 3480), try nextRunForCronExpression("8/25 * * * *", 1980));
+    try std.testing.expectEqual(@as(i64, 4080), try nextRunForCronExpression("8/25 * * * *", 3480));
+}
+
+test "nextRunForCronExpression supports hourly schedule" {
+    try std.testing.expectEqual(@as(i64, 3600), try nextRunForCronExpression("0 * * * *", 0));
+}
+
+test "nextRunForCronExpression supports fixed time schedule" {
+    try std.testing.expectEqual(@as(i64, 9000), try nextRunForCronExpression("30 2 * * *", 0));
+}
+
+test "nextRunForCronExpression supports sunday aliases 0 and 7" {
+    const next_sun_zero = try nextRunForCronExpression("0 0 * * 0", 0);
+    const next_sun_seven = try nextRunForCronExpression("0 0 * * 7", 0);
+    try std.testing.expectEqual(next_sun_zero, next_sun_seven);
+}
+
+test "nextRunForCronExpression handles leap-day schedules beyond one year" {
+    try std.testing.expectEqual(@as(i64, 68169600), try nextRunForCronExpression("0 0 29 2 *", 0));
+}
+
+test "CronScheduler add and list" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    try std.testing.expectEqualStrings("*/10 * * * *", job.expression);
+    try std.testing.expectEqualStrings("echo roundtrip", job.command);
+    try std.testing.expect(!job.one_shot);
+    try std.testing.expect(!job.paused);
+
+    const listed = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+}
+
+test "CronScheduler addOnce creates one-shot" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addOnce("30m", "echo once");
+    try std.testing.expect(job.one_shot);
+}
+
+test "CronScheduler remove" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/10 * * * *", "echo test");
+    try std.testing.expect(scheduler.removeJob(job.id));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+}
+
+test "CronScheduler generated IDs stay unique after removals" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const j1 = try scheduler.addJob("*/10 * * * *", "echo first");
+    const j1_id = try std.testing.allocator.dupe(u8, j1.id);
+    defer std.testing.allocator.free(j1_id);
+    const j2 = try scheduler.addJob("*/10 * * * *", "echo second");
+    const j2_id = try std.testing.allocator.dupe(u8, j2.id);
+    defer std.testing.allocator.free(j2_id);
+    const j3 = try scheduler.addJob("*/10 * * * *", "echo third");
+    const j3_id = try std.testing.allocator.dupe(u8, j3.id);
+    defer std.testing.allocator.free(j3_id);
+
+    try std.testing.expect(scheduler.removeJob(j2_id));
+
+    const j4 = try scheduler.addJob("*/10 * * * *", "echo fourth");
+    try std.testing.expect(!std.mem.eql(u8, j4.id, j1_id));
+    try std.testing.expect(!std.mem.eql(u8, j4.id, j3_id));
+}
+
+test "CronScheduler pause and resume" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo pause");
+    try std.testing.expect(scheduler.pauseJob(job.id));
+    try std.testing.expect(scheduler.getJob(job.id).?.paused);
+    try std.testing.expect(scheduler.resumeJob(job.id));
+    try std.testing.expect(!scheduler.getJob(job.id).?.paused);
+}
+
+test "CronScheduler max tasks enforced" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 1, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("*/10 * * * *", "echo first");
+    try std.testing.expectError(error.MaxTasksReached, scheduler.addJob("*/11 * * * *", "echo second"));
+}
+
+test "CronScheduler getJob found and missing" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo found");
+    try std.testing.expect(scheduler.getJob(job.id) != null);
+    try std.testing.expect(scheduler.getJob("nonexistent") == null);
+}
+
+test "save and load roundtrip" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const recurring = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    if (scheduler.getMutableJob(recurring.id)) |job| {
+        job.last_run_secs = 1_772_455_140;
+        job.last_status = "ok";
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    _ = try scheduler.addOnce("5m", "echo oneshot");
+
+    // Save to disk
+    try saveJobs(&scheduler);
+
+    // Load into a new scheduler
+    var scheduler2 = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler2.deinit();
+    try loadJobs(&scheduler2);
+
+    try std.testing.expectEqual(@as(usize, 2), scheduler2.listJobs().len);
+
+    const loaded = scheduler2.listJobs();
+    try std.testing.expectEqualStrings("*/10 * * * *", loaded[0].expression);
+    try std.testing.expectEqualStrings("echo roundtrip", loaded[0].command);
+    try std.testing.expectEqual(@as(?i64, 1_772_455_140), loaded[0].last_run_secs);
+    try std.testing.expect(loaded[0].last_status != null);
+    try std.testing.expectEqualStrings("ok", loaded[0].last_status.?);
+    try std.testing.expect(loaded[1].one_shot);
+}
+
+test "load agent job without command field falls back to prompt" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    // Write a cron.json with an agent job that has no "command" field
+    const json =
+        \\[{"id":"ag-1","expression":"0 7 * * 1","job_type":"agent","prompt":"Check traffic","model":"glm-cn/glm-5-turbo","paused":false,"one_shot":false,"enabled":true,"delete_after_run":false,"delivery_mode":"none"}]
+    ;
+    const path = try cronJsonPath(std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const file = try std_compat.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(json);
+
+    try loadJobsStrict(&scheduler);
+
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqualStrings("Check traffic", jobs[0].command);
+    try std.testing.expectEqualStrings("Check traffic", jobs[0].prompt.?);
+}
+
+test "load agent job without prompt field falls back to command" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const json =
+        \\[{"id":"ag-2","expression":"15 9 * * 2","job_type":"agent","command":"Summarize incidents","model":"openrouter/anthropic/claude-sonnet-4","paused":false,"one_shot":false,"enabled":true,"delete_after_run":false,"delivery_mode":"none"}]
+    ;
+    const path = try cronJsonPath(std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const file = try std_compat.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(json);
+
+    try loadJobsStrict(&scheduler);
+
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqualStrings("Summarize incidents", jobs[0].command);
+    try std.testing.expect(jobs[0].prompt != null);
+    try std.testing.expectEqualStrings("Summarize incidents", jobs[0].prompt.?);
+}
+
+test "trimOwnedRight duplicates trimmed allocation" {
+    const raw = try std.testing.allocator.dupe(u8, "zc_token\n");
+    const trimmed = trimOwnedRight(std.testing.allocator, raw) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(trimmed);
+
+    try std.testing.expectEqualStrings("zc_token", trimmed);
+}
+
+test "save and load roundtrip keeps delivery account routing" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/10 * * * *", "echo routed");
+    if (scheduler.getMutableJob(job.id)) |mutable_job| {
+        mutable_job.delivery = .{
+            .mode = .always,
+            .channel = try std.testing.allocator.dupe(u8, "telegram"),
+            .account_id = try std.testing.allocator.dupe(u8, "backup"),
+            .to = try std.testing.allocator.dupe(u8, "chat-42"),
+            .channel_owned = true,
+            .account_id_owned = true,
+            .to_owned = true,
+        };
+    } else {
+        return error.TestUnexpectedResult;
+    }
+
+    try saveJobs(&scheduler);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    const loaded_job = loaded.listJobs()[0];
+    try std.testing.expectEqual(DeliveryMode.always, loaded_job.delivery.mode);
+    try std.testing.expect(loaded_job.delivery.channel != null);
+    try std.testing.expectEqualStrings("telegram", loaded_job.delivery.channel.?);
+    try std.testing.expect(loaded_job.delivery.account_id != null);
+    try std.testing.expectEqualStrings("backup", loaded_job.delivery.account_id.?);
+    try std.testing.expect(loaded_job.delivery.to != null);
+    try std.testing.expectEqualStrings("chat-42", loaded_job.delivery.to.?);
+}
+
+test "cliRunJob persists last status and timestamp" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("* * * * *", "echo cli_run_status");
+    const job_id = try std.testing.allocator.dupe(u8, job.id);
+    defer std.testing.allocator.free(job_id);
+    try saveJobs(&scheduler);
+
+    try cliRunJob(std.testing.allocator, job_id);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    const loaded_job = loaded.getJob(job_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(loaded_job.last_run_secs != null);
+    try std.testing.expect(loaded_job.last_status != null);
+    try std.testing.expectEqualStrings("ok", loaded_job.last_status.?);
+}
+
+test "resolveRunnableCwd keeps valid cwd" {
+    const resolved = resolveRunnableCwd(".");
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualStrings(".", resolved.?);
+}
+
+test "resolveRunnableCwd returns null for missing cwd" {
+    const resolved = resolveRunnableCwd("__nullclaw_missing_cwd_for_cron_tests__/subdir");
+    try std.testing.expect(resolved == null);
+}
+
+test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("*/10 * * * *", "echo keep");
+    try saveJobs(&scheduler);
+
+    var runtime = CronScheduler.init(std.testing.allocator, 10, true);
+    defer runtime.deinit();
+    try loadJobs(&runtime);
+    try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
+
+    const path = try cronJsonPath(std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const bad_file = try std_compat.fs.createFileAbsolute(path, .{});
+    defer bad_file.close();
+    try bad_file.writeAll("{bad-json");
+
+    try reloadJobs(&runtime);
+    try std.testing.expectEqual(@as(usize, 1), runtime.listJobs().len);
+
+    // Store should be healed and parseable again.
+    var healed = CronScheduler.init(std.testing.allocator, 10, true);
+    defer healed.deinit();
+    try loadJobsStrict(&healed);
+    try std.testing.expectEqual(@as(usize, 1), healed.listJobs().len);
+}
+
+test "save and load roundtrip with JSON-sensitive command characters" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+    scheduler.setShellPolicy(.{ .autonomy = .yolo, .allowed_commands = &.{"*"} });
+
+    const cmd = "printf \"line1\\nline2\" && echo \\\"ok\\\"";
+    _ = try scheduler.addJob("*/5 * * * *", cmd);
+
+    try saveJobs(&scheduler);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    try std.testing.expectEqualStrings(cmd, loaded.listJobs()[0].command);
+}
+
+test "save and load roundtrip keeps agent fields" {
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+    try resetCronStoreForTest(std.testing.allocator);
+    defer resetCronStoreForTest(std.testing.allocator) catch {};
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const recurring = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat-42",
+        .peer_kind = .group,
+        .peer_id = "-100123",
+        .thread_id = "77",
+        .best_effort = false,
+    });
+    recurring.session_target = .main;
+    try saveJobs(&scheduler);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    const job = loaded.listJobs()[0];
+    try std.testing.expectEqual(JobType.agent, job.job_type);
+    try std.testing.expect(job.prompt != null);
+    try std.testing.expectEqualStrings("Summarize release status", job.prompt.?);
+    try std.testing.expect(job.model != null);
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
+    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
+    try std.testing.expect(job.delivery.channel != null);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expect(job.delivery.account_id != null);
+    try std.testing.expectEqualStrings("backup", job.delivery.account_id.?);
+    try std.testing.expect(job.delivery.to != null);
+    try std.testing.expectEqualStrings("chat-42", job.delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, job.delivery.peer_kind.?);
+    try std.testing.expect(job.delivery.peer_id != null);
+    try std.testing.expectEqualStrings("-100123", job.delivery.peer_id.?);
+    try std.testing.expect(job.delivery.thread_id != null);
+    try std.testing.expectEqualStrings("77", job.delivery.thread_id.?);
+    try std.testing.expect(!job.delivery.best_effort);
+    try std.testing.expectEqual(SessionTarget.main, job.session_target);
+}
+
+test "cliAddAgentOnce persists delivery routing" {
+    // Regression: once-agent delivery fields must survive CLI storage and reload.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @import("compat").c_stdlib;
+    const allocator = std.testing.allocator;
+
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+
+    const env_name = try allocator.dupeSentinel(u8, "NULLCLAW_HOME", 0);
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeSentinel(u8, value, 0) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeSentinel(u8, test_home, 0);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
+    try resetCronStoreForTest(allocator);
+    defer resetCronStoreForTest(allocator) catch {};
+
+    try cliAddAgentOnce(allocator, "30s", "Summarize status", "test-model", .isolated, .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "chat-42",
+        .best_effort = false,
+    });
+
+    var loaded = CronScheduler.init(allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    const job = loaded.listJobs()[0];
+    try std.testing.expect(job.one_shot);
+    try std.testing.expectEqual(JobType.agent, job.job_type);
+    try std.testing.expectEqualStrings("Summarize status", job.prompt.?);
+    try std.testing.expectEqualStrings("test-model", job.model.?);
+    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expectEqualStrings("main", job.delivery.account_id.?);
+    try std.testing.expectEqualStrings("chat-42", job.delivery.to.?);
+    try std.testing.expect(!job.delivery.best_effort);
+}
+
+test "JobType parse and asStr" {
+    try std.testing.expectEqual(JobType.shell, JobType.parse("shell"));
+    try std.testing.expectEqual(JobType.agent, JobType.parse("agent"));
+    try std.testing.expectEqual(JobType.agent, JobType.parse("AGENT"));
+    try std.testing.expectEqualStrings("shell", JobType.shell.asStr());
+    try std.testing.expectEqualStrings("agent", JobType.agent.asStr());
+}
+
+test "SessionTarget parse and asStr" {
+    try std.testing.expectEqual(SessionTarget.isolated, SessionTarget.parse("isolated"));
+    try std.testing.expectEqual(SessionTarget.main, SessionTarget.parse("main"));
+    try std.testing.expectEqual(SessionTarget.main, SessionTarget.parse("MAIN"));
+    try std.testing.expectEqualStrings("isolated", SessionTarget.isolated.asStr());
+    try std.testing.expectEqualStrings("main", SessionTarget.main.asStr());
+}
+
+test "SessionTarget parseStrict rejects invalid values" {
+    try std.testing.expectEqual(SessionTarget.isolated, try SessionTarget.parseStrict("isolated"));
+    try std.testing.expectEqual(SessionTarget.main, try SessionTarget.parseStrict("MAIN"));
+    try std.testing.expectError(error.InvalidSessionTarget, SessionTarget.parseStrict("primary"));
+}
+
+test "CronJob has new fields" {
+    const job = CronJob{
+        .id = "test",
+        .expression = "* * * * *",
+        .command = "echo hi",
+        .job_type = .agent,
+        .session_target = .main,
+        .enabled = true,
+        .delete_after_run = false,
+        .created_at_s = 1000000,
+    };
+    try std.testing.expectEqual(JobType.agent, job.job_type);
+    try std.testing.expectEqual(SessionTarget.main, job.session_target);
+    try std.testing.expect(job.enabled);
+    try std.testing.expectEqual(@as(i64, 1000000), job.created_at_s);
+}
+
+test "getMutableJob returns mutable pointer" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("* * * * *", "echo test");
+    const jobs = scheduler.listJobs();
+    const id = jobs[0].id;
+    const job = scheduler.getMutableJob(id);
+    try std.testing.expect(job != null);
+    try std.testing.expectEqualStrings(id, job.?.id);
+}
+
+test "updateJob modifies job fields" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("* * * * *", "echo original");
+    const jobs = scheduler.listJobs();
+    const id = jobs[0].id;
+    const patch = CronJobPatch{ .command = "echo updated", .enabled = false, .session_target = .main };
+    try std.testing.expect(scheduler.updateJob(allocator, id, patch));
+    const updated = scheduler.getJob(id).?;
+    try std.testing.expectEqualStrings("echo updated", updated.command);
+    try std.testing.expect(!updated.enabled);
+    try std.testing.expect(updated.paused);
+    try std.testing.expectEqual(SessionTarget.main, updated.session_target);
+}
+
+test "cron shell add rejects command blocked by security policy" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    const allowed = [_][]const u8{"cat"};
+    scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
+
+    try std.testing.expectError(error.CommandNotAllowed, scheduler.addJob("* * * * *", "echo blocked"));
+}
+
+test "cron shell update rejects command blocked by security policy" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("* * * * *", "echo original");
+    const id = scheduler.listJobs()[0].id;
+
+    const allowed = [_][]const u8{"cat"};
+    scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
+
+    try std.testing.expect(!scheduler.updateJob(allocator, id, .{ .command = "echo blocked" }));
+    try std.testing.expectEqualStrings("echo original", scheduler.getJob(id).?.command);
+}
+
+test "cron shell tick blocks previously stored command when policy changes" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("* * * * *", "echo stored");
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    const allowed = [_][]const u8{"cat"};
+    scheduler.setShellPolicy(.{ .allowed_commands = &allowed });
+
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
+
+    try std.testing.expectEqualStrings("error", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expectEqualStrings("cron shell command blocked by security policy", scheduler.jobs.items[0].last_output.?);
+}
+
+test "updateJob keeps agent command and prompt in sync" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addAgentJob("* * * * *", "old prompt", "model-a", .{});
+    const id = scheduler.listJobs()[0].id;
+
+    // Back-compat: updating command should update agent prompt.
+    try std.testing.expect(scheduler.updateJob(allocator, id, .{ .command = "new command prompt" }));
+    var updated = scheduler.getJob(id).?;
+    try std.testing.expect(updated.prompt != null);
+    try std.testing.expectEqualStrings("new command prompt", updated.command);
+    try std.testing.expectEqualStrings("new command prompt", updated.prompt.?);
+
+    // Explicit prompt/model update should persist both.
+    try std.testing.expect(scheduler.updateJob(allocator, id, .{
+        .prompt = "explicit prompt",
+        .model = "model-b",
+    }));
+    updated = scheduler.getJob(id).?;
+    try std.testing.expect(updated.prompt != null);
+    try std.testing.expectEqualStrings("explicit prompt", updated.command);
+    try std.testing.expectEqualStrings("explicit prompt", updated.prompt.?);
+    try std.testing.expect(updated.model != null);
+    try std.testing.expectEqualStrings("model-b", updated.model.?);
+}
+
+test "CronScheduler remove frees agent job fields" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addAgentJob("* * * * *", "prompt to free", "model-to-free", .{});
+    try std.testing.expect(scheduler.removeJob(job.id));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+}
+
+test "getMutableJob returns null for unknown id" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    try std.testing.expect(scheduler.getMutableJob("nonexistent") == null);
+}
+
+test "addRun and listRuns" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("* * * * *", "echo test");
+    const jobs = scheduler.listJobs();
+    const id = jobs[0].id;
+    try scheduler.addRun(allocator, id, 1000, 1001, "success", "output", 10);
+    try scheduler.addRun(allocator, id, 1001, 1002, "error", null, 10);
+    const runs = try scheduler.listRuns(allocator, id, 10);
+    defer allocator.free(runs);
+    try std.testing.expect(runs.len > 0);
+}
+
+test "addRun prunes history" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+    _ = try scheduler.addJob("* * * * *", "echo test");
+    const jobs = scheduler.listJobs();
+    const id = jobs[0].id;
+    // Add 5 runs with max_history=3
+    var i: i64 = 0;
+    while (i < 5) : (i += 1) {
+        try scheduler.addRun(allocator, id, i, i + 1, "success", null, 3);
+    }
+    const runs = try scheduler.listRuns(allocator, id, 100);
+    defer allocator.free(runs);
+    try std.testing.expect(runs.len <= 3);
+}
+
+test "listRuns returns only matching job runs when interleaved" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("* * * * *", "echo a");
+    _ = try scheduler.addJob("* * * * *", "echo b");
+
+    const job_a_id = try allocator.dupe(u8, scheduler.listJobs()[0].id);
+    defer allocator.free(job_a_id);
+    const job_b_id = try allocator.dupe(u8, scheduler.listJobs()[1].id);
+    defer allocator.free(job_b_id);
+
+    try scheduler.addRun(allocator, job_a_id, 1000, 1001, "ok", null, 10);
+    try scheduler.addRun(allocator, job_b_id, 1001, 1002, "ok", null, 10);
+    try scheduler.addRun(allocator, job_a_id, 1002, 1003, "ok", null, 10);
+    try scheduler.addRun(allocator, job_b_id, 1003, 1004, "ok", null, 10);
+
+    const runs_a = try scheduler.listRuns(allocator, job_a_id, 10);
+    defer allocator.free(runs_a);
+    try std.testing.expectEqual(@as(usize, 2), runs_a.len);
+    for (runs_a) |run| {
+        try std.testing.expectEqualStrings(job_a_id, run.job_id);
+    }
+}
+
+test "tick removes more than 64 one-shot jobs in one pass" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 128, true);
+    defer scheduler.deinit();
+
+    var i: usize = 0;
+    while (i < 80) : (i += 1) {
+        _ = try scheduler.addAgentOnce("1s", "noop prompt", null, .{});
+    }
+
+    const now = std_compat.time.timestamp();
+    _ = scheduler.tick(now + 2, null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+}
+
+// ── Delivery + Bus integration tests ────────────────────────────
+
+test "deliverResult creates correct OutboundMessage" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "chat123",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus);
+    try std.testing.expect(delivered);
+
+    // Consume and verify the message
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("chat123", msg.chat_id);
+    try std.testing.expectEqualStrings("job output here", msg.content);
+}
+
+test "deliverResult preserves account routing when delivery account_id is set" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat123",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "job output here", true, &test_bus);
+    try std.testing.expect(delivered);
+
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expect(msg.account_id != null);
+    try std.testing.expectEqualStrings("backup", msg.account_id.?);
+}
+
+test "deliverResult with mode none does nothing" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .none,
+        .channel = "telegram",
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult with no channel does nothing" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = null,
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult on_success skips on failure" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .on_success,
+        .channel = "telegram",
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "error output", false, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult on_error skips on success" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .on_error,
+        .channel = "telegram",
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "ok output", true, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult on_error delivers on failure" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .on_error,
+        .channel = "discord",
+        .to = "room42",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "crash log", false, &test_bus);
+    try std.testing.expect(delivered);
+
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("discord", msg.channel);
+    try std.testing.expectEqualStrings("room42", msg.chat_id);
+    try std.testing.expectEqualStrings("crash log", msg.content);
+}
+
+test "deliverResult uses default chat_id when to is null" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "webhook",
+        .to = null,
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "hello", true, &test_bus);
+    try std.testing.expect(delivered);
+
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("default", msg.chat_id);
+}
+
+test "deliverResult skips empty output" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "chat1",
+    };
+
+    const delivered = try deliverResult(allocator, delivery, "", true, &test_bus);
+    try std.testing.expect(!delivered);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult best_effort swallows closed bus error" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    test_bus.close(); // close before delivery
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "chat1",
+        .best_effort = true,
+    };
+
+    // Should not return error because best_effort is true
+    const delivered = try deliverResult(allocator, delivery, "msg", true, &test_bus);
+    try std.testing.expect(!delivered);
+}
+
+test "deliverViaMainAgent preserves account metadata and session key" {
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "backup",
+        .to = "chat123",
+    };
+
+    const delivered = try deliverViaMainAgent(allocator, delivery, "job output here", true, &test_bus, "traffic");
+    try std.testing.expect(delivered);
+
+    var msg = test_bus.consumeInbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("system:cron", msg.sender_id);
+    try std.testing.expectEqualStrings("chat123", msg.chat_id);
+    try std.testing.expectEqualStrings("telegram:backup:chat123", msg.session_key);
+    try std.testing.expect(msg.metadata_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "Scheduled task 'traffic'") != null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, msg.metadata_json.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("backup", parsed.value.object.get("account_id").?.string);
+    try std.testing.expectEqualStrings("chat123", parsed.value.object.get("peer_id").?.string);
+}
+
+test "one-shot job deleted after tick execution" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addOnce("1s", "echo oneshot");
+    // Verify job was created
+    try std.testing.expect(job.one_shot);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.listJobs().len);
+
+    // Force the job to be due now
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    // Tick without bus — the shell command "echo oneshot" will actually run
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
+
+    // One-shot job should have been removed
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+}
+
+test "shell job uses configured cwd for relative output paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    scheduler.setShellCwd(workspace);
+    scheduler.setShellPolicy(.{ .autonomy = .yolo, .allowed_commands = &.{"*"} });
+    defer scheduler.deinit();
+
+    _ = try scheduler.addOnce("1s", "echo cwd_ok > cwd_proof.txt");
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
+
+    const proof_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("cwd_proof.txt", .{});
+    proof_file.close();
+}
+
+test "shell job delivers stdout via bus" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addJob("* * * * *", "echo hello_cron");
+    _ = job;
+
+    // Configure delivery
+    scheduler.jobs.items[0].delivery = .{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "chat99",
+    };
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
+
+    // Verify delivery happened
+    try std.testing.expect(test_bus.outboundDepth() > 0);
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("chat99", msg.chat_id);
+    // The content should contain "hello_cron" from the echo command
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "hello_cron") != null);
+}
+
+test "agent job delivers result via bus" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize today's news", null, .{
+        .mode = .always,
+        .channel = "discord",
+        .to = "general",
+    });
+    job.next_run_secs = 0;
+
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
+
+    // Verify delivery
+    try std.testing.expect(test_bus.outboundDepth() > 0);
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("discord", msg.channel);
+    try std.testing.expectEqualStrings("general", msg.chat_id);
+    try std.testing.expectEqualStrings("Summarize today's news", msg.content);
+}
+
+test "one-shot isolated agent delivery outlives removed job" {
+    // Regression (#941): the outbound queue must not retain freed job delivery routing.
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentOnce("1s", "Summarize status", null, .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "chat-42",
+    });
+    job.next_run_secs = 0;
+
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("main", msg.account_id.?);
+    try std.testing.expectEqualStrings("chat-42", msg.chat_id);
+    try std.testing.expectEqualStrings("Summarize status", msg.content);
+}
+
+test "one-shot main agent delivery outlives removed job" {
+    // Regression (#941): the inbound queue has the same lifetime boundary as outbound delivery.
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentOnce("1s", "Summarize status", null, .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "chat-42",
+    });
+    job.session_target = .main;
+    job.next_run_secs = 0;
+
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+
+    var msg = test_bus.consumeInbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("system:cron", msg.sender_id);
+    try std.testing.expectEqualStrings("chat-42", msg.chat_id);
+    try std.testing.expectEqualStrings("telegram:main:chat-42", msg.session_key);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "Summarize status") != null);
+}
+
+test "agent run options preserve cron delivery attribution" {
+    // Regression: every cron execution path must pass saved origin metadata to the child agent.
+    const options = agentRunOptionsForDelivery(.{
+        .channel = "telegram",
+        .account_id = "main",
+    });
+    try std.testing.expectEqualStrings("telegram", options.origin_channel.?);
+    try std.testing.expectEqualStrings("main", options.origin_account_id.?);
+}
+
+test "DeliveryMode parse and asStr" {
+    try std.testing.expectEqual(DeliveryMode.none, DeliveryMode.parse("none"));
+    try std.testing.expectEqual(DeliveryMode.always, DeliveryMode.parse("always"));
+    try std.testing.expectEqual(DeliveryMode.on_error, DeliveryMode.parse("on_error"));
+    try std.testing.expectEqual(DeliveryMode.on_success, DeliveryMode.parse("on_success"));
+    try std.testing.expectEqual(DeliveryMode.none, DeliveryMode.parse("unknown"));
+    try std.testing.expectEqual(DeliveryMode.always, DeliveryMode.parse("ALWAYS"));
+
+    try std.testing.expectEqualStrings("none", DeliveryMode.none.asStr());
+    try std.testing.expectEqualStrings("always", DeliveryMode.always.asStr());
+    try std.testing.expectEqualStrings("on_error", DeliveryMode.on_error.asStr());
+    try std.testing.expectEqualStrings("on_success", DeliveryMode.on_success.asStr());
+}
+
+test "probeSchedulerStatus reports missing config file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+    const daemon_state_path = try std_compat.fs.path.join(allocator, &.{ base, "daemon_state.json" });
+    defer allocator.free(daemon_state_path);
+
+    const status = probeSchedulerStatus(config_path, daemon_state_path, true);
+    try std.testing.expect(!status.config_exists);
+    try std.testing.expect(status.scheduler_enabled);
+    try std.testing.expect(!status.daemon_state_present);
+    try std.testing.expect(status.config_probe_error == null);
+}
+
+test "probeSchedulerStatus reports config and daemon state files independently" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+    const daemon_state_path = try std_compat.fs.path.join(allocator, &.{ base, "daemon_state.json" });
+    defer allocator.free(daemon_state_path);
+
+    {
+        const file = try std_compat.fs.createFileAbsolute(config_path, .{});
+        defer file.close();
+        try file.writeAll("{}\n");
+    }
+
+    var status = probeSchedulerStatus(config_path, daemon_state_path, false);
+    try std.testing.expect(status.config_exists);
+    try std.testing.expect(!status.scheduler_enabled);
+    try std.testing.expect(!status.daemon_state_present);
+
+    {
+        const file = try std_compat.fs.createFileAbsolute(daemon_state_path, .{});
+        defer file.close();
+        try file.writeAll("{\"status\":\"running\"}\n");
+    }
+
+    status = probeSchedulerStatus(config_path, daemon_state_path, false);
+    try std.testing.expect(status.config_exists);
+    try std.testing.expect(!status.scheduler_enabled);
+    try std.testing.expect(status.daemon_state_present);
+}
+
+test "tick without bus still executes jobs" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("* * * * *", "echo silent");
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    // Tick with null bus — should not crash
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
+
+    // Job should have been executed and rescheduled
+    try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expect(scheduler.jobs.items[0].next_run_secs > 0);
+}
+
+test "tick records cron start delivery attribution" {
+    const RecordingObserver = struct {
+        saw_cron_job_start: bool = false,
+        last_channel: ?[]const u8 = null,
+        last_bot_account: ?[]const u8 = null,
+
+        const vtable = observability.Observer.VTable{
+            .record_event = recordEvent,
+            .record_metric = recordMetric,
+            .flush = flush,
+            .name = name,
+            .get_trace_id = getTraceId,
+            .set_trace_id = setTraceId,
+        };
+
+        fn observer(self: *@This()) observability.Observer {
+            return .{
+                .ptr = @ptrCast(self),
+                .vtable = &vtable,
+            };
+        }
+
+        fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (event.*) {
+                .cron_job_start => |payload| {
+                    self.saw_cron_job_start = true;
+                    self.last_channel = payload.channel;
+                    self.last_bot_account = payload.bot_account;
+                },
+                else => {},
+            }
+        }
+
+        fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+        fn flush(_: *anyopaque) void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "recording";
+        }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var observer = RecordingObserver{};
+    scheduler.observer = observer.observer();
+
+    _ = try scheduler.addJob("* * * * *", "echo attributed");
+    scheduler.jobs.items[0].delivery.channel = "telegram";
+    scheduler.jobs.items[0].delivery.account_id = "bot-main";
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    // Regression: cron_job_start should preserve the delivery metadata carried by the job.
+    _ = scheduler.tick(0, null);
+
+    try std.testing.expect(observer.saw_cron_job_start);
+    try std.testing.expectEqualStrings("telegram", observer.last_channel.?);
+    try std.testing.expectEqualStrings("bot-main", observer.last_bot_account.?);
+}
+
+test "tick reschedules recurring job using cron expression" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("*/10 * * * *", "echo periodic");
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    _ = scheduler.tick(0, null);
+    try std.testing.expectEqual(@as(i64, 600), scheduler.jobs.items[0].next_run_secs);
+}
+
+test "tick reschedules anchored recurring job using cron expression" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addJob("8/25 * * * *", "echo anchored");
+    scheduler.jobs.items[0].next_run_secs = 480;
+
+    _ = scheduler.tick(480, null);
+    try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
+    try std.testing.expectEqual(@as(i64, 1980), scheduler.jobs.items[0].next_run_secs);
+
+    _ = scheduler.tick(1980, null);
+    try std.testing.expectEqual(@as(i64, 3480), scheduler.jobs.items[0].next_run_secs);
+
+    _ = scheduler.tick(3480, null);
+    try std.testing.expectEqual(@as(i64, 4080), scheduler.jobs.items[0].next_run_secs);
+}
+
+// Regression: #691 — NULLCLAW_HOME must override the HOME-based fallback.
+test "resolveConfigDir prefers NULLCLAW_HOME override" {
+    const allocator = std.testing.allocator;
+    const dir = try config_paths.defaultConfigDirFromInputs(allocator, "test-nullclaw-data", "ignored-home");
+    defer allocator.free(dir);
+    try std.testing.expectEqualStrings("test-nullclaw-data", dir);
+}
+
+// Regression: #691 — without NULLCLAW_HOME, cron.zig must use HOME/.nullclaw.
+test "resolveConfigDir falls back to HOME/.nullclaw when NULLCLAW_HOME unset" {
+    const allocator = std.testing.allocator;
+    const dir = try config_paths.defaultConfigDirFromInputs(allocator, null, "test-home");
+    defer allocator.free(dir);
+
+    const expected = try std_compat.fs.path.join(allocator, &.{ "test-home", ".nullclaw" });
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, dir);
+}
+
+// Regression: #691 — cron.json must live under the resolved config directory.
+test "cronJsonPath appends cron.json to resolved config dir" {
+    const allocator = std.testing.allocator;
+    const path = try cronJsonPathFromDir(allocator, "test-nullclaw-data");
+    defer allocator.free(path);
+
+    const expected = try std_compat.fs.path.join(allocator, &.{ "test-nullclaw-data", "cron.json" });
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, path);
+}
+
+test "resolveConfigDir reports missing home when no config directory inputs exist" {
+    try std.testing.expectError(error.HomeDirNotFound, config_paths.defaultConfigDirFromInputs(std.testing.allocator, null, null));
+}
+
+test "buildJobsJson serializes cron jobs for CLI read-side" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("*/5 * * * *", "echo hello");
+    _ = scheduler.pauseJob(job.id);
+
+    const json = try buildJobsJson(std.testing.allocator, scheduler.listJobs());
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"echo hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"paused\":true") != null);
+}
+
+test "buildSchedulerStatusJson reports scheduler summary" {
+    const json = try buildSchedulerStatusJson(
+        std.testing.allocator,
+        .{
+            .config_exists = true,
+            .scheduler_enabled = true,
+            .daemon_state_present = false,
+            .config_probe_error = null,
+        },
+        3,
+        2,
+        1,
+    );
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status\":\"waiting_for_daemon\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"job_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"active_jobs\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"paused_jobs\":1") != null);
+}
+
+test "cron register + cancel leaks zero bytes for every job kind" {
+    // Uses the leak-detecting GPA (std.testing.allocator). Any allocation
+    // in addJob / addOnce / addAgentJob / addAgentOnce that is not freed
+    // by removeJob will be reported as a leak when the test runner tears
+    // down the allocator.
+    //
+    // The agent-job path is the most leak-prone — it allocates id,
+    // expression, command, prompt, model (optional), delivery.channel,
+    // delivery.account_id, delivery.to, delivery.peer_id, and
+    // delivery.thread_id, each behind its own _owned flag in freeJobOwned.
+    // The original new test only covered addJob + addOnce and would have
+    // missed a regression in any of those agent-only fields.
+    const alloc = std.testing.allocator;
+
+    var sched = CronScheduler.init(alloc, 10, true);
+    defer sched.deinit();
+
+    // Recurring shell job.
+    const recurring = try sched.addJob("*/5 * * * *", "echo recurring");
+    // dupe the id because removeJob takes ownership of (frees) the matched
+    // job's heap-owned id; passing the original `recurring.id` slice would
+    // be a use-after-free pattern.
+    const recurring_id = try alloc.dupe(u8, recurring.id);
+    defer alloc.free(recurring_id);
+    try std.testing.expect(sched.removeJob(recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot shell job: extra `@once:<delay>` expression allocation.
+    const once = try sched.addOnce("10m", "echo once");
+    const once_id = try alloc.dupe(u8, once.id);
+    defer alloc.free(once_id);
+    try std.testing.expect(sched.removeJob(once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // Recurring agent job: every delivery field non-null to exercise the
+    // full _owned-flag matrix in freeJobOwned.
+    const agent_recurring = try sched.addAgentJob("*/15 * * * *", "be helpful", "claude-sonnet", .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "12345",
+        .peer_kind = .direct,
+        .peer_id = "user-99",
+        .thread_id = "topic-7",
+        .best_effort = false,
+    });
+    const agent_recurring_id = try alloc.dupe(u8, agent_recurring.id);
+    defer alloc.free(agent_recurring_id);
+    try std.testing.expect(sched.removeJob(agent_recurring_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // One-shot agent job: same field matrix, plus the `@once:<delay>` expr.
+    // Pass `null` for model to exercise the optional-skip path.
+    const agent_once = try sched.addAgentOnce("5m", "remind me", null, .{
+        .mode = .on_success,
+        .channel = "discord",
+        .account_id = "guild-42",
+        .to = "channel-7",
+        .peer_kind = .group,
+        .peer_id = "guild-42",
+        .thread_id = null,
+        .best_effort = true,
+    });
+    const agent_once_id = try alloc.dupe(u8, agent_once.id);
+    defer alloc.free(agent_once_id);
+    try std.testing.expect(sched.removeJob(agent_once_id));
+    try std.testing.expectEqual(@as(usize, 0), sched.listJobs().len);
+
+    // removeJob on an unknown id must return false without leaking or
+    // crashing, regardless of whether jobs are present.
+    try std.testing.expect(!sched.removeJob("nonexistent-id"));
+}
+
+test "cron rejects obviously malformed expressions" {
+    // Each input exercises a distinct branch in parseCronExpression /
+    // parseCronField. Note: "* * * * * * *" (7 fields) is valid per the
+    // spec and is excluded.
+    const malformed = [_][]const u8{
+        "", // empty
+        "garbage", // single non-cron token
+        "* * *", // wrong field count (3, not 5/6/7)
+        "60 * * * *", // minute out of range
+        "* 24 * * *", // hour out of range
+        "* * 32 * *", // day-of-month out of range
+        "* * * 13 *", // month out of range
+        "* * * * 8", // day-of-week out of range (allow_sunday_7 caps at 7)
+        "*/0 * * * *", // step = 0 — divide-by-zero classic
+        "5-3 * * * *", // reversed range (start > end)
+        "abc * * * *", // alphabetic in numeric field
+    };
+    for (malformed) |input| {
+        const result = nextRunForCronExpression(input, 0);
+        try std.testing.expect(std.meta.isError(result));
+    }
+}
+
+// ── paired_token persistence tests (issue #839) ────────────────────
+//
+// Regression: the schedule/cron tool authenticates to the gateway /cron
+// endpoint with a bearer token read from <config_dir>/paired_token, but
+// nothing ever wrote that file — so /cron returned 401 when pairing was
+// required. These tests cover encrypted cron-scoped token persistence.
+
+test "persistPairedToken writes encrypted machine token and round-trips" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const token = "zc_deadbeefcafebabe0000000000000000000000000000000000000000000000ff";
+
+    try persistPairedToken(std.testing.allocator, tmp_path, token);
+
+    // The file on disk must NOT contain the plaintext token.
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    const on_disk = try fs_compat.readFileAlloc(std_compat.fs.cwd(), std.testing.allocator, token_path, 8192);
+    defer std.testing.allocator.free(on_disk);
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, on_disk, " \t\r\n"), "enc2:"));
+    try std.testing.expect(std.mem.indexOf(u8, on_disk, token) == null);
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        const token_file = try fs_compat.openPath(token_path, .{ .follow_symlinks = false });
+        defer token_file.close();
+        const metadata = try token_file.stat();
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o600), metadata.mode & 0o777);
+    }
+
+    // Reading via the config-dir-aware reader must recover the plaintext token.
+    const read_back = readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRead;
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings(token, read_back);
+}
+
+test "readPairedTokenFromDir returns null when paired_token absent" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "readPairedTokenFromDir returns null for empty file" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    // Seed an empty (whitespace-only) paired_token — the legacy "nothing here" state.
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    try fs_compat.writeFileAtomicSecure(token_path, "   ");
+
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "readPairedTokenFromDir passes legacy plaintext through unchanged" {
+    // Backward compatibility: a pre-existing plaintext paired_token (written by
+    // an older tool or operator) must still be readable without decryption.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const legacy_token = "zc_legacy_plaintext_token_no_enc2_prefix";
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    try fs_compat.writeFileAtomicSecure(token_path, legacy_token);
+
+    const read_back = readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRead;
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings(legacy_token, read_back);
+}
+
+test "readPairedTokenFromDir detects tampered encrypted blob" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try persistPairedToken(std.testing.allocator, tmp_path, "zc_tamper_test_token_0123456789abcdef0123456789abcdef");
+
+    // Flip a byte in the middle of the enc2: blob.
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    const original = try fs_compat.readFileAlloc(std_compat.fs.cwd(), std.testing.allocator, token_path, 8192);
+    defer std.testing.allocator.free(original);
+    var tampered = try std.testing.allocator.dupe(u8, original);
+    defer std.testing.allocator.free(tampered);
+    const flip_at = std.mem.indexOf(u8, tampered, ":").? + 4; // inside hex payload
+    tampered[flip_at] = if (tampered[flip_at] == '0') '1' else '0';
+    try fs_compat.writeFileAtomicSecure(token_path, tampered);
+
+    // Tampered AEAD must fail decryption → reader returns null (graceful, not a crash).
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "readPairedTokenFromDir rejects symlink" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try std_compat.fs.Dir.wrap(tmp_dir.dir).writeFile(.{
+        .sub_path = "outside-token",
+        .data = "zc_symlink_target_must_not_be_read",
+    });
+    try std_compat.fs.Dir.wrap(tmp_dir.dir).symLink("outside-token", "paired_token", .{});
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}

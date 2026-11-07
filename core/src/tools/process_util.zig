@@ -1,0 +1,769 @@
+const std = @import("std");
+const std_compat = @import("compat");
+const AtomicBool = std.atomic.Value(bool);
+const builtin = @import("builtin");
+
+// Win32 APIs used for codepage fallback decoding on Windows.
+extern "kernel32" fn MultiByteToWideChar(
+    code_page: std.os.windows.UINT,
+    flags: std.os.windows.DWORD,
+    input: ?[*]const u8,
+    input_len: i32,
+    output: ?[*]u16,
+    output_len: i32,
+) callconv(.winapi) i32;
+
+extern "kernel32" fn WideCharToMultiByte(
+    code_page: std.os.windows.UINT,
+    flags: std.os.windows.DWORD,
+    input: ?[*]const u16,
+    input_len: i32,
+    output: ?[*]u8,
+    output_len: i32,
+    default_char: ?[*]const u8,
+    used_default_char: ?*std.os.windows.BOOL,
+) callconv(.winapi) i32;
+
+extern "kernel32" fn GetACP() callconv(.winapi) std.os.windows.UINT;
+extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) std.os.windows.UINT;
+extern "kernel32" fn GetProcessId(process_handle: std.os.windows.HANDLE) callconv(.winapi) std.os.windows.DWORD;
+extern "kernel32" fn WaitForSingleObject(
+    handle: std.os.windows.HANDLE,
+    milliseconds: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.DWORD;
+extern "kernel32" fn OpenProcess(
+    desired_access: std.os.windows.DWORD,
+    inherit_handle: std.os.windows.BOOL,
+    process_id: std.os.windows.DWORD,
+) callconv(.winapi) ?std.os.windows.HANDLE;
+
+const CP_UTF8: std.os.windows.UINT = 65001;
+const CP_GBK: std.os.windows.UINT = 936;
+const MB_ERR_INVALID_CHARS: std.os.windows.DWORD = 0x00000008;
+const PROCESS_SYNCHRONIZE: std.os.windows.DWORD = 0x00100000;
+const WAIT_OBJECT_0: std.os.windows.DWORD = 0x00000000;
+const WAIT_TIMEOUT: std.os.windows.DWORD = 0x00000102;
+
+threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
+
+pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
+    thread_interrupt_flag = flag;
+}
+
+/// Result of a child process execution.
+pub const RunResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    success: bool,
+    exit_code: ?u32 = null,
+    interrupted: bool = false,
+    timed_out: bool = false,
+
+    /// Free both stdout and stderr buffers.
+    pub fn deinit(self: *const RunResult, allocator: std.mem.Allocator) void {
+        if (self.stdout.len > 0) allocator.free(self.stdout);
+        if (self.stderr.len > 0) allocator.free(self.stderr);
+    }
+};
+
+/// Options for running a child process.
+pub const RunOptions = struct {
+    cwd: ?[]const u8 = null,
+    env_map: ?*std_compat.process.EnvMap = null,
+    max_output_bytes: usize = 1_048_576,
+    cancel_flag: ?*const AtomicBool = null,
+    timeout_ns: ?u64 = null,
+};
+
+const ProcessWatcherCtx = struct {
+    child: *std_compat.process.Child,
+    cancel_flag: ?*const AtomicBool,
+    timeout_ns: ?u64,
+    done: *AtomicBool,
+    timed_out: *AtomicBool,
+};
+
+fn terminateWindowsProcessTreeByPid(pid: std.os.windows.DWORD) void {
+    if (pid == 0) return;
+
+    var pid_buf: [32]u8 = undefined;
+    if (std.fmt.bufPrint(&pid_buf, "{d}", .{pid})) |pid_arg| {
+        // `TerminateProcess` only reaches the direct child handle; use
+        // `taskkill /T` first so shell wrappers do not strand descendants.
+        var taskkill = std_compat.process.Child.init(&.{ "taskkill", "/T", "/F", "/PID", pid_arg }, std.heap.page_allocator);
+        taskkill.stdin_behavior = .Ignore;
+        taskkill.stdout_behavior = .Ignore;
+        taskkill.stderr_behavior = .Ignore;
+        taskkill.create_no_window = true;
+        _ = taskkill.spawnAndWait() catch null;
+    } else |_| {}
+}
+
+fn linuxProcessParentPid(allocator: std.mem.Allocator, pid: std.posix.pid_t) ?std.posix.pid_t {
+    if (builtin.os.tag != .linux) return null;
+    const path = std.fmt.allocPrint(allocator, "/proc/{d}/stat", .{pid}) catch return null;
+    defer allocator.free(path);
+
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 4096) catch return null;
+    defer allocator.free(content);
+
+    const close_idx = std.mem.lastIndexOfScalar(u8, content, ')') orelse return null;
+    if (close_idx + 2 >= content.len) return null;
+    const fields = std_compat.mem.trimLeft(u8, content[close_idx + 1 ..], ") ");
+    const state_end = std.mem.indexOfScalar(u8, fields, ' ') orelse return null;
+    const after_state = std_compat.mem.trimLeft(u8, fields[state_end..], " ");
+    const ppid_end = std.mem.indexOfScalar(u8, after_state, ' ') orelse after_state.len;
+    return std.fmt.parseInt(std.posix.pid_t, after_state[0..ppid_end], 10) catch null;
+}
+
+fn terminateLinuxChildProcessesFromChildrenFile(parent_pid: std.posix.pid_t, signal: std.posix.SIG) void {
+    if (builtin.os.tag != .linux) return;
+
+    const allocator = std.heap.page_allocator;
+    const path = std.fmt.allocPrint(allocator, "/proc/{d}/task/{d}/children", .{ parent_pid, parent_pid }) catch return;
+    defer allocator.free(path);
+
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 8192) catch return;
+    defer allocator.free(content);
+
+    var it = std.mem.tokenizeAny(u8, content, " \t\r\n");
+    while (it.next()) |pid_bytes| {
+        const pid = std.fmt.parseInt(std.posix.pid_t, pid_bytes, 10) catch continue;
+        terminateLinuxChildProcessesFromChildrenFile(pid, signal);
+        std.posix.kill(pid, signal) catch {};
+    }
+}
+
+fn terminateLinuxChildProcesses(parent_pid: std.posix.pid_t, signal: std.posix.SIG) void {
+    if (builtin.os.tag != .linux) return;
+    terminateLinuxChildProcessesFromChildrenFile(parent_pid, signal);
+
+    var proc_dir = std_compat.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return;
+    defer proc_dir.close();
+
+    var iter = proc_dir.iterate();
+    while (iter.next() catch null) |entry| {
+        const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        if (linuxProcessParentPid(std.heap.page_allocator, pid)) |ppid| {
+            if (ppid == parent_pid) {
+                terminateLinuxChildProcesses(pid, signal);
+                std.posix.kill(pid, signal) catch {};
+            }
+        }
+    }
+}
+
+fn terminateChild(child: *std_compat.process.Child) void {
+    if (comptime builtin.os.tag == .windows) {
+        terminateWindowsProcessTreeByPid(GetProcessId(child.id));
+        _ = child.kill() catch {};
+    } else if (comptime builtin.os.tag == .wasi) {
+        return;
+    } else {
+        const process_group_id: std.posix.pid_t = -child.id;
+        std.posix.kill(process_group_id, std.posix.SIG.TERM) catch {
+            std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+        };
+        if (comptime builtin.os.tag == .linux) {
+            terminateLinuxChildProcesses(child.id, std.posix.SIG.TERM);
+        }
+
+        std_compat.thread.sleep(100 * std.time.ns_per_ms);
+        if (comptime builtin.os.tag == .linux) {
+            terminateLinuxChildProcesses(child.id, std.posix.SIG.KILL);
+        }
+        std.posix.kill(process_group_id, std.posix.SIG.KILL) catch |err| switch (err) {
+            error.ProcessNotFound => std.posix.kill(child.id, std.posix.SIG.KILL) catch {},
+            else => {},
+        };
+    }
+}
+
+fn processWatcherMain(ctx: *ProcessWatcherCtx) void {
+    const poll_ns = 20 * std.time.ns_per_ms;
+    var waited_ns: u64 = 0;
+
+    while (!ctx.done.load(.acquire)) {
+        if (ctx.cancel_flag) |flag| {
+            if (flag.load(.acquire)) {
+                terminateChild(ctx.child);
+                break;
+            }
+        }
+        if (ctx.timeout_ns) |limit| {
+            if (waited_ns >= limit) {
+                ctx.timed_out.store(true, .release);
+                terminateChild(ctx.child);
+                break;
+            }
+        }
+        std_compat.thread.sleep(poll_ns);
+        waited_ns +|= poll_ns;
+    }
+}
+
+fn wasInterrupted(cancel_flag: ?*const AtomicBool) bool {
+    if (cancel_flag) |flag| {
+        return flag.load(.acquire);
+    }
+    return false;
+}
+
+fn processExists(pid: std.posix.pid_t) bool {
+    std.posix.kill(pid, @as(std.posix.SIG, @enumFromInt(0))) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return true,
+    };
+    return true;
+}
+
+fn processIsZombie(allocator: std.mem.Allocator, pid: std.posix.pid_t) bool {
+    if (builtin.os.tag != .linux) return false;
+    const path = std.fmt.allocPrint(allocator, "/proc/{d}/stat", .{pid}) catch return false;
+    defer allocator.free(path);
+
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return false;
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 4096) catch return false;
+    defer allocator.free(content);
+
+    const close_idx = std.mem.lastIndexOfScalar(u8, content, ')') orelse return false;
+    if (close_idx + 2 >= content.len) return false;
+    return content[close_idx + 2] == 'Z';
+}
+
+fn processExistsWindows(pid: std.os.windows.DWORD) bool {
+    if (pid == 0) return false;
+
+    const handle = OpenProcess(PROCESS_SYNCHRONIZE, .FALSE, pid) orelse return false;
+    defer std.os.windows.CloseHandle(handle);
+
+    return switch (WaitForSingleObject(handle, 0)) {
+        WAIT_TIMEOUT => true,
+        WAIT_OBJECT_0 => false,
+        else => false,
+    };
+}
+
+fn appendUtf8Replacement(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
+    try out.appendSlice(allocator, "\xEF\xBF\xBD");
+}
+
+fn lossilyNormalizeToUtf8(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.ensureTotalCapacity(allocator, input.len);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        const byte = input[i];
+        if (byte < 0x80) {
+            try out.append(allocator, byte);
+            i += 1;
+            continue;
+        }
+
+        const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+            try appendUtf8Replacement(&out, allocator);
+            i += 1;
+            continue;
+        };
+
+        const step: usize = @intCast(seq_len);
+        if (i + step > input.len) {
+            try appendUtf8Replacement(&out, allocator);
+            i += 1;
+            continue;
+        }
+
+        const candidate = input[i .. i + step];
+        _ = std.unicode.utf8Decode(candidate) catch {
+            try appendUtf8Replacement(&out, allocator);
+            i += 1;
+            continue;
+        };
+
+        try out.appendSlice(allocator, candidate);
+        i += step;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn tryDecodeWindowsCodePageToUtf8(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    code_page: std.os.windows.UINT,
+) !?[]u8 {
+    if (input.len == 0 or code_page == 0) return null;
+
+    const in_len: i32 = std.math.cast(i32, input.len) orelse return null;
+    // Keep UTF-8 strict so a console forced to CP_UTF8 does not swallow
+    // ACP/GBK bytes with U+FFFD substitutions before we can try fallbacks.
+    const decode_flags: std.os.windows.DWORD = if (code_page == CP_UTF8) MB_ERR_INVALID_CHARS else 0;
+
+    const wide_len = MultiByteToWideChar(code_page, decode_flags, input.ptr, in_len, null, 0);
+    if (wide_len <= 0) return null;
+
+    const wide_len_usize: usize = @intCast(wide_len);
+    const wide = try allocator.alloc(u16, wide_len_usize);
+    defer allocator.free(wide);
+
+    if (MultiByteToWideChar(code_page, decode_flags, input.ptr, in_len, wide.ptr, wide_len) <= 0) return null;
+
+    const utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide.ptr, wide_len, null, 0, null, null);
+    if (utf8_len <= 0) return null;
+
+    const utf8_len_usize: usize = @intCast(utf8_len);
+    const out = try allocator.alloc(u8, utf8_len_usize);
+    errdefer allocator.free(out);
+
+    if (WideCharToMultiByte(CP_UTF8, 0, wide.ptr, wide_len, out.ptr, utf8_len, null, null) <= 0) return null;
+
+    return out;
+}
+
+fn tryDecodeWindowsOutputToUtf8(allocator: std.mem.Allocator, input: []const u8) !?[]u8 {
+    const console_cp = GetConsoleOutputCP();
+    if (try tryDecodeWindowsCodePageToUtf8(allocator, input, console_cp)) |decoded| return decoded;
+
+    // Prefer GBK before ACP: Western single-byte ACPs like CP1252 will happily
+    // decode arbitrary high bytes into mojibake ("ÖÐÎÄ"), which would mask
+    // genuine GBK console output that we can still recover losslessly.
+    const ansi_cp = GetACP();
+    if (console_cp != CP_GBK and ansi_cp != CP_GBK) {
+        if (try tryDecodeWindowsCodePageToUtf8(allocator, input, CP_GBK)) |decoded| return decoded;
+    }
+
+    if (ansi_cp != console_cp) {
+        if (try tryDecodeWindowsCodePageToUtf8(allocator, input, ansi_cp)) |decoded| return decoded;
+    }
+
+    return null;
+}
+
+fn normalizeCapturedOutputOwned(allocator: std.mem.Allocator, input: []u8) ![]u8 {
+    if (std.unicode.utf8ValidateSlice(input)) return input;
+
+    if (comptime builtin.os.tag == .windows) {
+        if (try tryDecodeWindowsOutputToUtf8(allocator, input)) |decoded| {
+            allocator.free(input);
+            return decoded;
+        }
+    }
+
+    const lossy = try lossilyNormalizeToUtf8(allocator, input);
+    allocator.free(input);
+    return lossy;
+}
+
+/// Run a child process, capture stdout and stderr, and return the result.
+///
+/// The caller owns the returned stdout and stderr buffers.
+/// Use `result.deinit(allocator)` to free them.
+pub fn run(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    opts: RunOptions,
+) !RunResult {
+    var child = std_compat.process.Child.init(argv, allocator);
+    // Captured child processes are non-interactive; inheriting stdin can let
+    // spawned commands stall waiting for input from the parent process.
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        // Isolate the child into its own process group so timeout/cancel signals
+        // can terminate shell wrappers together with any descendants they spawn.
+        child.pgid = 0;
+    }
+    if (opts.cwd) |cwd| child.cwd = cwd;
+    if (opts.env_map) |env| child.env_map = env;
+
+    try child.spawn();
+
+    const effective_cancel_flag = opts.cancel_flag orelse thread_interrupt_flag;
+    const effective_timeout_ns = if (opts.timeout_ns) |limit|
+        if (limit == 0) null else limit
+    else
+        null;
+    var cancel_done = AtomicBool.init(false);
+    var timed_out = AtomicBool.init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var watcher_ctx: ProcessWatcherCtx = undefined;
+    if (effective_cancel_flag != null or effective_timeout_ns != null) {
+        watcher_ctx = .{
+            .child = &child,
+            .cancel_flag = effective_cancel_flag,
+            .timeout_ns = effective_timeout_ns,
+            .done = &cancel_done,
+            .timed_out = &timed_out,
+        };
+        cancel_watcher = std.Thread.spawn(.{}, processWatcherMain, .{&watcher_ctx}) catch null;
+    }
+    defer {
+        cancel_done.store(true, .release);
+        if (cancel_watcher) |t| t.join();
+    }
+
+    var stdout = if (child.stdout) |stdout_file| blk: {
+        break :blk stdout_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
+            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) {
+                break :blk try allocator.dupe(u8, "");
+            }
+            return err;
+        };
+    } else try allocator.dupe(u8, "");
+    errdefer allocator.free(stdout);
+    stdout = try normalizeCapturedOutputOwned(allocator, stdout);
+
+    var stderr = if (child.stderr) |stderr_file| blk: {
+        break :blk stderr_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
+            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) {
+                break :blk try allocator.dupe(u8, "");
+            }
+            return err;
+        };
+    } else try allocator.dupe(u8, "");
+    errdefer allocator.free(stderr);
+    stderr = try normalizeCapturedOutputOwned(allocator, stderr);
+
+    const term = try child.wait();
+    const interrupted = wasInterrupted(effective_cancel_flag);
+    const did_time_out = timed_out.load(.acquire);
+
+    return switch (term) {
+        .exited => |code| .{
+            .stdout = stdout,
+            .stderr = stderr,
+            .success = code == 0,
+            .exit_code = code,
+            .interrupted = interrupted,
+            .timed_out = did_time_out,
+        },
+        else => .{
+            .stdout = stdout,
+            .stderr = stderr,
+            .success = false,
+            .exit_code = null,
+            .interrupted = interrupted,
+            .timed_out = did_time_out,
+        },
+    };
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+test "run echo returns stdout" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const result = try run(allocator, &.{ "echo", "hello" }, .{});
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(u32, 0), result.exit_code.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "hello") != null);
+}
+
+test "run failing command returns exit code" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const result = try run(allocator, &.{ "ls", "/nonexistent_dir_xyz_42" }, .{});
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.exit_code.? != 0);
+    try std.testing.expect(result.stderr.len > 0);
+}
+
+test "run with cwd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const result = try run(allocator, &.{"pwd"}, .{ .cwd = "/tmp" });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.success);
+    // /tmp may resolve to /private/tmp on macOS
+    try std.testing.expect(result.stdout.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "tmp") != null);
+}
+
+test "run honors cancel flag and interrupts child" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var cancel = AtomicBool.init(false);
+
+    const ThreadResult = struct {
+        res: ?RunResult = null,
+        err: ?anyerror = null,
+    };
+    var thread_result = ThreadResult{};
+
+    const Runner = struct {
+        fn runThread(
+            allocator_inner: std.mem.Allocator,
+            cancel_flag: *const AtomicBool,
+            out: *ThreadResult,
+        ) void {
+            out.res = run(allocator_inner, &.{ "sh", "-c", "sleep 5; echo done" }, .{
+                .cancel_flag = cancel_flag,
+            }) catch |err| {
+                out.err = err;
+                return;
+            };
+        }
+    };
+
+    const t = try std.Thread.spawn(.{}, Runner.runThread, .{ allocator, &cancel, &thread_result });
+    std_compat.thread.sleep(100 * std.time.ns_per_ms);
+    cancel.store(true, .release);
+    t.join();
+
+    try std.testing.expect(thread_result.err == null);
+    const result = thread_result.res orelse return error.TestUnexpectedResult;
+    defer result.deinit(allocator);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.interrupted);
+    try std.testing.expect(!result.timed_out);
+}
+
+test "run timeout interrupts child" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const result = try run(allocator, &.{ "sh", "-c", "sleep 5" }, .{
+        .timeout_ns = 100 * std.time.ns_per_ms,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(!result.interrupted);
+    try std.testing.expect(result.timed_out);
+}
+
+test "run zero timeout disables watchdog" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const result = try run(allocator, &.{ "sh", "-c", "sleep 0.1; echo done" }, .{
+        .timeout_ns = 0,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(!result.timed_out);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "done") != null);
+}
+
+test "run timeout kills Windows shell descendants" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "child.pid" });
+    defer allocator.free(pid_path);
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
+        .sub_path = "child.ps1",
+        // Regression: invoking PowerShell through `-Command ... -- arg` is not
+        // reliable on GitHub's Windows runner and can let cmd.exe exit before
+        // the timeout watchdog fires. Keep the payload in a script file so the
+        // wrapper deterministically stays alive until the watchdog kills it.
+        .data =
+        \\param([string]$PidPath)
+        \\$PID | Set-Content -NoNewline -LiteralPath $PidPath
+        \\Start-Sleep -Seconds 8
+        \\
+        ,
+    });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
+        .sub_path = "wrapper.cmd",
+        // Keep cmd.exe in front so the test still exercises descendant cleanup
+        // instead of timing out a direct PowerShell child.
+        .data =
+        \\@echo off
+        \\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0child.ps1" "%~dp0child.pid"
+        \\
+        ,
+    });
+    const script_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "wrapper.cmd" });
+    defer allocator.free(script_path);
+
+    const result = try run(allocator, &.{ "cmd.exe", "/c", script_path }, .{
+        .timeout_ns = 2 * std.time.ns_per_s,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.timed_out);
+
+    var pid_bytes: ?[]u8 = null;
+    var read_attempt: usize = 0;
+    while (read_attempt < 20) : (read_attempt += 1) {
+        pid_bytes = std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 32) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                std_compat.thread.sleep(50 * std.time.ns_per_ms);
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (pid_bytes != null) break;
+    }
+    const pid_bytes_owned = pid_bytes orelse return error.FileNotFound;
+    defer allocator.free(pid_bytes_owned);
+    const child_pid = try std.fmt.parseInt(
+        std.os.windows.DWORD,
+        std.mem.trim(u8, pid_bytes_owned, " \t\r\n"),
+        10,
+    );
+    defer if (processExistsWindows(child_pid)) terminateWindowsProcessTreeByPid(child_pid);
+
+    var exited = false;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        if (!processExistsWindows(child_pid)) {
+            exited = true;
+            break;
+        }
+        std_compat.thread.sleep(50 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(exited);
+}
+
+test "run timeout kills spawned shell descendants" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std_compat.fs.path.join(allocator, &.{ tmp_path, "child.pid" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(allocator, "(sleep 30) & echo $! > \"{s}\"; wait", .{pid_path});
+    defer allocator.free(command);
+
+    // Regression: timing out `sh -c ...` must not leave a background child
+    // running after the wrapper shell exits.
+    const result = try run(allocator, &.{ "sh", "-c", command }, .{
+        .timeout_ns = 200 * std.time.ns_per_ms,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.timed_out);
+
+    const pid_bytes = try std_compat.fs.cwd().readFileAlloc(allocator, pid_path, 32);
+    defer allocator.free(pid_bytes);
+    const child_pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_bytes, " \t\r\n"),
+        10,
+    );
+    defer if (processExists(child_pid)) {
+        std.posix.kill(child_pid, std.posix.SIG.KILL) catch {};
+    };
+
+    var exited = false;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        if (!processExists(child_pid) or processIsZombie(allocator, child_pid)) {
+            exited = true;
+            break;
+        }
+        std_compat.thread.sleep(50 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(exited);
+}
+
+test "RunResult deinit frees buffers" {
+    const allocator = std.testing.allocator;
+    const stdout = try allocator.dupe(u8, "output");
+    const stderr = try allocator.dupe(u8, "error");
+    const result = RunResult{
+        .stdout = stdout,
+        .stderr = stderr,
+        .success = true,
+        .exit_code = 0,
+    };
+    result.deinit(allocator);
+}
+
+test "RunResult deinit with empty buffers" {
+    const allocator = std.testing.allocator;
+    const result = RunResult{
+        .stdout = "",
+        .stderr = "",
+        .success = true,
+        .exit_code = 0,
+    };
+    result.deinit(allocator); // should not crash or attempt to free ""
+}
+
+test "normalizeCapturedOutputOwned converts invalid UTF-8 to safe text" {
+    const allocator = std.testing.allocator;
+    const invalid = try allocator.dupe(u8, &[_]u8{ 'f', 0x80, 'o' });
+    const normalized = try normalizeCapturedOutputOwned(allocator, invalid);
+    defer allocator.free(normalized);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(normalized));
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "f") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "o") != null);
+}
+
+test "run normalizes invalid stderr before returning" {
+    const allocator = std.testing.allocator;
+    const argv: []const []const u8 = if (comptime builtin.os.tag == .windows)
+        &.{
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            "[Console]::OpenStandardError().Write([byte[]](0xD6,0xD0,0xCE,0xC4),0,4); exit 1",
+        }
+    else
+        &.{ "sh", "-c", "printf '\\200' >&2; exit 1" };
+
+    const result = try run(allocator, argv, .{});
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.stderr));
+    if (comptime builtin.os.tag == .windows) {
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "中文") != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "\xEF\xBF\xBD") != null);
+    }
+}
+
+test "windows gbk fallback decodes to utf8" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const gbk = [_]u8{ 0xD6, 0xD0, 0xCE, 0xC4 }; // "中文" in GBK/CP936
+    const decoded = try tryDecodeWindowsCodePageToUtf8(allocator, &gbk, CP_GBK);
+    try std.testing.expect(decoded != null);
+    defer allocator.free(decoded.?);
+
+    try std.testing.expect(std.unicode.utf8ValidateSlice(decoded.?));
+    const expected_utf8 = [_]u8{ 0xE4, 0xB8, 0xAD, 0xE6, 0x96, 0x87 }; // "zhongwen" (Chinese chars) in UTF-8 bytes
+    try std.testing.expectEqualSlices(u8, &expected_utf8, decoded.?);
+}
+
+test "windows utf8 decoder rejects gbk bytes so ansi fallback can run" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const gbk = [_]u8{ 0xD6, 0xD0, 0xCE, 0xC4 }; // "中文" in GBK/CP936
+    const decoded = try tryDecodeWindowsCodePageToUtf8(allocator, &gbk, CP_UTF8);
+    try std.testing.expect(decoded == null);
+}

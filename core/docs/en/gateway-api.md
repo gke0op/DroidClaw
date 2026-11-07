@@ -1,0 +1,362 @@
+# Gateway API
+
+Default gateway endpoint: `http://127.0.0.1:3000`
+
+## Page Guide
+
+**Who this page is for**
+
+- Operators wiring external systems into the local gateway
+- Integrators testing pairing, bearer-token auth, and webhook delivery
+- Reviewers checking what the HTTP surface exposes by default
+
+**Read this next**
+
+- Open [Security](./security.md) before exposing any gateway path beyond loopback or tunnel defaults
+- Open [Configuration](./configuration.md) if you need the concrete `gateway` and channel keys behind these examples
+- Open [Usage and Operations](./usage.md) for runtime checks, restarts, and troubleshooting around gateway behavior
+
+**If you came from ...**
+
+- [Usage and Operations](./usage.md): this page provides the endpoint-level detail behind the gateway health and webhook checks
+- [Security](./security.md): come here when a security review needs the concrete HTTP auth and endpoint surface
+- [Configuration](./configuration.md): return here after editing `gateway` settings to validate the API-facing behavior
+
+## Endpoints
+
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/health` | GET | None | Health check |
+| `/pair` | POST | `X-Pairing-Code` | Exchange one-time pairing code for bearer token (loopback-only when gateway is publicly bound) |
+| `/webhook` | POST | `Authorization: Bearer <token>` | Send message payload: `{"message":"..."}` |
+| `/media/transcribe` | POST | `Authorization: Bearer <token>` | Transcribe base64 audio payloads through configured STT provider |
+| `/cron` | GET | Cron-scoped bearer or full gateway bearer when auth is required | List live scheduler jobs from the running daemon |
+| `/cron/add` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Add or schedule a live cron job |
+| `/cron/remove` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Remove a live cron job by `id` |
+| `/cron/pause` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Pause a live cron job by `id` |
+| `/cron/resume` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Resume a live cron job by `id` |
+| `/cron/update` | POST | Cron-scoped bearer or full gateway bearer when auth is required | Partially update a live cron job |
+| `/telegram` | POST | `X-Telegram-Bot-Api-Secret-Token` matching `channels.telegram.accounts.<id>.webhook_secret` | Telegram inbound webhook |
+| `/whatsapp` | GET | Query params | Meta webhook verification |
+| `/whatsapp` | POST | Meta signature | WhatsApp inbound webhook |
+| `/max` | POST | `X-Max-Bot-Api-Secret` when configured | Max inbound webhook delivery |
+| `/api/messages` | POST | `Authorization: Bearer <Bot Framework JWT>` and optional `X-Webhook-Secret` | Teams Bot Framework inbound webhook |
+| `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
+| `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC 2.0 endpoint |
+
+## Quick Examples
+
+### 1) Health check
+
+```bash
+curl http://127.0.0.1:3000/health
+```
+
+### 2) Pair and get token
+
+```bash
+curl -X POST \
+  -H "X-Pairing-Code: PAIRING_CODE" \
+  http://127.0.0.1:3000/pair
+```
+
+Expected: bearer token response (exact JSON shape may vary by version).
+
+### 3) Send webhook message
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"hello from webhook"}' \
+  http://127.0.0.1:3000/webhook
+```
+
+### 4) List live cron jobs
+
+```bash
+curl -X GET \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  http://127.0.0.1:3000/cron
+```
+
+### 5) Add a live cron job
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"expression":"*/15 * * * *","command":"echo hello"}' \
+  http://127.0.0.1:3000/cron/add
+```
+
+`/cron/add` also accepts one-shot payloads such as `{"delay":"10m","command":"echo later"}` and agent payloads such as `{"expression":"0 * * * *","prompt":"Summarize alerts","model":"openrouter/anthropic/claude-sonnet-4"}`.
+
+### 6) Max webhook delivery
+
+Single-account example:
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Max-Bot-Api-Secret: YOUR_MAX_SECRET" \
+  -d '{"update_type":"bot_started","chat_id":100,"timestamp":1710000000000,"user":{"user_id":42,"first_name":"Igor"}}' \
+  http://127.0.0.1:3000/max
+```
+
+Multi-account example:
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-Max-Bot-Api-Secret: YOUR_MAX_SECRET" \
+  -d '{"update_type":"message_created","timestamp":1710000000000,"message":{"sender":{"user_id":42,"first_name":"Igor"},"recipient":{"chat_id":100,"chat_type":"dialog"},"body":{"mid":"m1","text":"ping"}}}' \
+  "http://127.0.0.1:3000/max?account_id=main"
+```
+
+Max webhook notes:
+
+- `nullclaw` routes `/max` to the configured Max account by `account_id` query first, then by `X-Max-Bot-Api-Secret`.
+- If `channels.max.accounts.<id>.webhook_secret` is configured, the header is required and must match exactly.
+- Use HTTPS in the configured Max-side webhook URL.
+
+Teams webhook notes:
+
+- `nullclaw` validates the Bot Framework bearer token against Microsoft's OpenID metadata and signing keys before accepting the activity.
+- The token issuer must be `https://api.botframework.com`, the audience must match the configured Teams `client_id`, and the token `serviceUrl` must match the activity body.
+- Teams `channelId` endorsements are enforced from the published Bot Framework key metadata.
+- If `channels.teams.accounts.<id>.webhook_secret` is configured, `X-Webhook-Secret` must also match exactly.
+
+## Media Transcription
+
+`POST /media/transcribe` is intended for local orchestrators. It requires the same bearer-token auth as `/webhook` and `/a2a`, and uses the configured `tools.media.audio` STT model.
+
+Request:
+
+```json
+{
+  "audio_base64": "BASE64_AUDIO_BYTES",
+  "mime_type": "audio/webm;codecs=opus",
+  "source": "mic",
+  "language": "en"
+}
+```
+
+Response:
+
+```json
+{
+  "text": "transcribed speech",
+  "source": "mic",
+  "language": "en",
+  "mime_type": "audio/webm;codecs=opus"
+}
+```
+
+Notes:
+
+- `audio_base64` is required; `mime_type` defaults to `audio/ogg`.
+- Only `audio/*` MIME types are accepted.
+- Raise `gateway.max_body_size_bytes`, `gateway.request_timeout_secs`, and `gateway.webhook_rate_limit_per_minute` for live desktop audio chunking.
+- `tools.media.audio.models[0]` selects the STT provider/model/endpoint. If that provider has no key, NullClaw falls back to a keyed OpenAI/Groq/Telnyx provider when available.
+- Custom STT endpoints must be HTTPS for remote hosts; plain HTTP is accepted only for local/private endpoints and URLs with query or fragment parts are rejected.
+
+## A2A (Agent-to-Agent Protocol)
+
+NullClaw implements [Google's A2A protocol v0.3.0](https://github.com/google/A2A) over JSON-RPC 2.0, enabling interoperability with any A2A-compatible agent or client.
+
+### Configuration
+
+Add to `~/.nullclaw/config.json`:
+
+```json
+{
+  "a2a": {
+    "enabled": true,
+    "name": "My Agent",
+    "description": "General-purpose AI assistant",
+    "url": "https://your-public-url.example.com",
+    "version": "0.3.0"
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Enable A2A endpoints |
+| `name` | `"NullClaw"` | Agent name in the Agent Card |
+| `description` | `"AI assistant"` | Agent description |
+| `url` | `""` | Public URL (used in Agent Card and `supportedInterfaces`) |
+| `version` | `"1.0.0"` | Agent version string |
+| `multi_modal` | `false` | Advertise multi-modal capability in the Agent Card. Set to `true` when the configured model supports image inputs. The gateway probes the model at startup and sets this automatically; override manually if needed. |
+
+**Multi-modal support**
+
+When `multi_modal` is `true`, the Agent Card includes `"multi_modal": true` in its capabilities object, signalling to A2A clients that the agent accepts image attachments. Incoming A2A messages may include `inlineData` parts (base64-encoded images) alongside `text` parts; the gateway forwards them to the model as `[IMAGE: <mime_type>]` markers.
+
+To accept large image payloads, raise the gateway's HTTP body limit and socket read timeout in the `gateway` config block (see [configuration.md](./configuration.md) `gateway` section):
+
+```json
+{
+  "gateway": {
+    "max_body_size_bytes": 67108864,
+    "request_timeout_secs": 120
+  }
+}
+```
+
+### Agent Card Discovery
+
+```bash
+curl http://127.0.0.1:3000/.well-known/agent-card.json
+```
+
+Returns the Agent Card with capabilities, skills, security schemes, and supported interfaces. No authentication required.
+
+### JSON-RPC Methods
+
+All methods are called via `POST /a2a` with a bearer token from `/pair`.
+
+| Method | Description |
+|--------|-------------|
+| `message/send` | Send a message, receive completed task |
+| `message/stream` | Send a message, receive SSE stream of events |
+| `tasks/get` | Retrieve task by ID (supports `historyLength`) |
+| `tasks/cancel` | Cancel an active task |
+| `tasks/list` | List tasks with optional `state`/`contextId` filters |
+| `tasks/resubscribe` | Resume SSE stream for an existing task |
+
+### Task Lifecycle
+
+```
+submitted → working → completed
+                    → failed
+                    → canceled
+                    → input-required
+                    → auth-required
+                    → rejected
+```
+
+Terminal states: `completed`, `failed`, `canceled`, `rejected`.
+
+### Examples
+
+**Send a message:**
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "message/send",
+    "params": {
+      "message": {
+        "messageId": "msg-1",
+        "role": "user",
+        "parts": [{"kind": "text", "text": "What is nullclaw?"}]
+      }
+    }
+  }' \
+  http://127.0.0.1:3000/a2a
+```
+
+**Stream a response (SSE):**
+
+```bash
+curl -N -X POST \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "message/stream",
+    "params": {
+      "message": {
+        "messageId": "msg-2",
+        "role": "user",
+        "parts": [{"kind": "text", "text": "Explain A2A protocol"}]
+      }
+    }
+  }' \
+  http://127.0.0.1:3000/a2a
+```
+
+**Get a task:**
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"id":"task-1"}}' \
+  http://127.0.0.1:3000/a2a
+```
+
+**Cancel a task:**
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tasks/cancel","params":{"id":"task-1"}}' \
+  http://127.0.0.1:3000/a2a
+```
+
+### Multi-turn Conversations
+
+Include `contextId` in the message to group tasks into a conversation. All messages with the same `contextId` share session state and conversation history:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "message/send",
+  "params": {
+    "message": {
+      "messageId": "msg-3",
+      "contextId": "my-conversation",
+      "role": "user",
+      "parts": [{"kind": "text", "text": "Follow-up question"}]
+    }
+  }
+}
+```
+
+### Error Codes
+
+| Code | Name | Description |
+|------|------|-------------|
+| -32700 | JSONParseError | Invalid JSON payload |
+| -32600 | InvalidRequestError | Request validation error |
+| -32601 | MethodNotFoundError | Unknown method |
+| -32602 | InvalidParamsError | Missing or invalid parameters |
+| -32603 | InternalError | Server-side error |
+| -32001 | TaskNotFoundError | Task ID not found |
+| -32002 | TaskNotCancelableError | Task already in terminal state |
+| -32003 | PushNotificationNotSupportedError | Push notifications not supported |
+| -32005 | ContentTypeNotSupportedError | Incompatible content types |
+| -32007 | AuthenticatedExtendedCardNotConfiguredError | Extended card not available |
+
+## Security Guidance
+
+1. Keep `gateway.require_pairing = true`.
+2. Keep gateway on loopback (`127.0.0.1`) and expose externally through tunnel/proxy.
+3. If you intentionally use a non-loopback bind, generic endpoints (`/webhook`, `/a2a`, `/media/transcribe`) still require a full gateway bearer token even when interactive pairing is disabled; preconfigure `gateway.paired_tokens` if you are not using `/pair`. `/cron/*` also accepts its dedicated cron-scoped bearer.
+4. On non-loopback binds, `/pair` only accepts loopback clients. Do initial pairing locally or preconfigure `gateway.paired_tokens` before exposing the port.
+5. Treat bearer tokens as secrets; do not commit or log them.
+6. Treat Max webhook secrets the same way: randomize them per account and do not reuse one secret across multiple bots.
+7. When cron authentication is required, the gateway creates a bearer scoped only to `/cron/*` at startup, retains its hash, and writes the encrypted credential to `paired_token` in the config directory with mode `0600`. The schedule/cron tool reads this file for control-plane requests. The token rotates on every gateway restart and cannot authorize webhook, A2A, media, or other admin routes. It is still a bearer credential, not an IP-bound proof of local origin, so protect the config directory from disclosure. Anonymous loopback gateways with `require_pairing = false` do not create it.
+
+## Next Steps
+
+- Review [Security](./security.md) before changing public exposure, pairing, or token-handling assumptions
+- Check [Configuration](./configuration.md) for the settings that back the examples on this page
+- Use [Usage and Operations](./usage.md) for gateway startup, health checks, and post-change validation flow
+
+## Related Pages
+
+- [Configuration](./configuration.md)
+- [Usage and Operations](./usage.md)
+- [Security](./security.md)
+- [README](./README.md)

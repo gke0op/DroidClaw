@@ -1,0 +1,1049 @@
+const std = @import("std");
+const std_compat = @import("compat");
+const crypto = @import("../security/secrets.zig");
+const platform = @import("../platform.zig");
+const policy = @import("policy.zig");
+
+/// Maximum failed pairing attempts before lockout.
+const MAX_PAIR_ATTEMPTS: u32 = 5;
+/// Lockout duration after too many failed pairing attempts (5 minutes).
+const PAIR_LOCKOUT_NS: i128 = 300 * std.time.ns_per_s;
+/// Lifetime of runtime-issued bearer tokens (30 days).
+pub const DEFAULT_TOKEN_TTL_SECS: u32 = 2_592_000;
+
+/// Manages pairing state for the gateway.
+///
+/// Bearer tokens are stored as SHA-256 hashes to prevent plaintext exposure
+/// in config files. When a new token is generated, the plaintext is returned
+/// to the client once, and only the hash is retained.
+pub const PairingGuard = struct {
+    const TokenScope = enum {
+        all,
+        cron,
+    };
+
+    const TokenRecord = struct {
+        expires_at: ?i64,
+        configured: bool,
+        scope: TokenScope,
+    };
+
+    /// Whether pairing is required at all.
+    require_pairing_flag: bool,
+    /// One-time pairing code (generated on startup, consumed on first pair).
+    pairing_code: ?[6]u8,
+    /// Set of SHA-256 hashed bearer tokens (hex strings) plus runtime expiry metadata.
+    paired_tokens: std.StringHashMap(TokenRecord),
+    token_ttl_secs: u32,
+    /// Brute-force protection
+    failed_count: u32,
+    lockout_time: ?i128, // nanoTimestamp when locked out
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, require_pairing: bool, existing_tokens: []const []const u8) !PairingGuard {
+        return initWithTokenTtl(allocator, require_pairing, existing_tokens, DEFAULT_TOKEN_TTL_SECS);
+    }
+
+    pub fn initWithTokenTtl(
+        allocator: std.mem.Allocator,
+        require_pairing: bool,
+        existing_tokens: []const []const u8,
+        token_ttl_secs: u32,
+    ) !PairingGuard {
+        var tokens = std.StringHashMap(TokenRecord).init(allocator);
+
+        for (existing_tokens) |t| {
+            if (isTokenHash(t)) {
+                const duped = try allocator.dupe(u8, t);
+                try tokens.put(duped, .{ .expires_at = null, .configured = true, .scope = .all });
+            } else {
+                const hashed = try hashTokenAlloc(allocator, t);
+                try tokens.put(hashed, .{ .expires_at = null, .configured = true, .scope = .all });
+            }
+        }
+
+        const code: ?[6]u8 = if (require_pairing and tokens.count() == 0) generateCode() else null;
+
+        return .{
+            .require_pairing_flag = require_pairing,
+            .pairing_code = code,
+            .paired_tokens = tokens,
+            .token_ttl_secs = token_ttl_secs,
+            .failed_count = 0,
+            .lockout_time = null,
+            .allocator = allocator,
+        };
+    }
+
+    pub const PairAttemptResult = union(enum) {
+        paired: []const u8,
+        missing_code,
+        invalid_code,
+        already_paired,
+        disabled,
+        locked_out,
+        internal_error,
+    };
+
+    pub const PairingCodeError = error{
+        PairingDisabled,
+        InvalidPairingCode,
+    };
+
+    pub fn attemptPair(self: *PairingGuard, pairing_code: ?[]const u8) PairAttemptResult {
+        if (!self.require_pairing_flag) return .disabled;
+        if (self.pairingCode() == null) return .already_paired;
+        const code = pairing_code orelse return .missing_code;
+        const token_opt = self.tryPair(code) catch |err| switch (err) {
+            error.LockedOut => return .locked_out,
+            else => return .internal_error,
+        };
+        if (token_opt) |token| return .{ .paired = token };
+        return .invalid_code;
+    }
+
+    pub fn deinit(self: *PairingGuard) void {
+        var it = self.paired_tokens.keyIterator();
+        while (it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.paired_tokens.deinit();
+    }
+
+    /// The one-time pairing code (only set when no active tokens exist yet).
+    pub fn pairingCode(self: *PairingGuard) ?[]const u8 {
+        if (self.require_pairing_flag and self.pairing_code == null and self.tokenCount() == 0) {
+            self.pairing_code = generateCode();
+            self.failed_count = 0;
+            self.lockout_time = null;
+        }
+        if (self.pairing_code) |*code| {
+            return code;
+        }
+        return null;
+    }
+
+    /// Regenerate one-time pairing code for the next pairing attempt.
+    pub fn regeneratePairingCode(self: *PairingGuard) ?[]const u8 {
+        if (!self.require_pairing_flag) {
+            self.pairing_code = null;
+            return null;
+        }
+        self.pairing_code = generateCode();
+        self.failed_count = 0;
+        self.lockout_time = null;
+        return self.pairingCode();
+    }
+
+    /// Force pairing code to a specific 6-digit value.
+    pub fn setPairingCode(self: *PairingGuard, code: []const u8) PairingCodeError![]const u8 {
+        if (!self.require_pairing_flag) return error.PairingDisabled;
+        const trimmed = std.mem.trim(u8, code, " \t\r\n");
+        if (trimmed.len != 6) return error.InvalidPairingCode;
+
+        var normalized: [6]u8 = undefined;
+        for (trimmed, 0..) |ch, i| {
+            if (!std.ascii.isDigit(ch)) return error.InvalidPairingCode;
+            normalized[i] = ch;
+        }
+
+        self.pairing_code = normalized;
+        self.failed_count = 0;
+        self.lockout_time = null;
+        return self.pairingCode().?;
+    }
+
+    /// Whether pairing is required at all.
+    pub fn requirePairing(self: *const PairingGuard) bool {
+        return self.require_pairing_flag;
+    }
+
+    /// Whether at least one bearer token has been issued (pairing completed).
+    pub fn hasPairedTokens(self: *const PairingGuard) bool {
+        return self.tokenCount() > 0;
+    }
+
+    /// Attempt to pair with the given code. Returns a bearer token on success.
+    /// Returns error.LockedOut if locked out due to brute force.
+    /// Returns null if code is incorrect.
+    pub fn tryPair(self: *PairingGuard, code: []const u8) !?[]const u8 {
+        // Check brute force lockout
+        if (self.failed_count >= MAX_PAIR_ATTEMPTS) {
+            if (self.lockout_time) |locked_at| {
+                const elapsed = std_compat.time.nanoTimestamp() - locked_at;
+                if (elapsed < PAIR_LOCKOUT_NS) {
+                    return error.LockedOut;
+                }
+                // Lockout expired, reset
+                self.failed_count = 0;
+                self.lockout_time = null;
+            }
+        }
+
+        if (self.pairing_code) |expected| {
+            const trimmed_code = std.mem.trim(u8, code, " \t\r\n");
+            const trimmed_expected = std.mem.trim(u8, &expected, " \t\r\n");
+            if (constantTimeEq(trimmed_code, trimmed_expected)) {
+                // Reset failed attempts on success
+                self.failed_count = 0;
+                self.lockout_time = null;
+
+                // Generate token
+                const token = generateToken();
+                const hashed = try hashTokenAlloc(self.allocator, &token);
+                try self.paired_tokens.put(hashed, .{
+                    .expires_at = tokenExpiresAt(self.token_ttl_secs),
+                    .configured = false,
+                    .scope = .all,
+                });
+
+                // Consume pairing code
+                self.pairing_code = null;
+
+                return try self.allocator.dupe(u8, &token);
+            }
+        }
+
+        // Increment failed attempts
+        self.failed_count += 1;
+        if (self.failed_count >= MAX_PAIR_ATTEMPTS) {
+            self.lockout_time = std_compat.time.nanoTimestamp();
+        }
+
+        return null;
+    }
+
+    /// Check if a bearer token is valid (compares against stored hashes).
+    pub fn isAuthenticated(self: *const PairingGuard, token: []const u8) bool {
+        if (!self.require_pairing_flag) return true;
+
+        return self.matchesToken(token, false, false);
+    }
+
+    /// Check whether a bearer token matches one of the stored token hashes,
+    /// regardless of whether interactive pairing is enabled.
+    pub fn matchesStoredToken(self: *const PairingGuard, token: []const u8) bool {
+        return self.matchesToken(token, false, false);
+    }
+
+    /// Check whether a bearer token matches a token loaded from config.
+    pub fn matchesConfiguredToken(self: *const PairingGuard, token: []const u8) bool {
+        return self.matchesToken(token, true, false);
+    }
+
+    /// Check a bearer for the cron control plane. Full gateway tokens and the
+    /// dedicated cron token are both accepted here; cron-scoped tokens are
+    /// deliberately rejected by every other authentication method.
+    pub fn isCronAuthenticated(self: *const PairingGuard, token: []const u8) bool {
+        return self.matchesToken(token, false, true);
+    }
+
+    /// Issue a process-lifetime token restricted to the cron control plane.
+    /// The caller receives the plaintext once and must persist it securely for
+    /// the local cron client; this guard retains only its SHA-256 hash.
+    pub fn issueCronToken(self: *PairingGuard) ![]const u8 {
+        const token = generateToken();
+        const token_owned = try self.allocator.dupe(u8, &token);
+        errdefer self.allocator.free(token_owned);
+        const hashed = try hashTokenAlloc(self.allocator, &token);
+        errdefer self.allocator.free(hashed);
+        try self.paired_tokens.put(hashed, .{
+            .expires_at = null,
+            .configured = false,
+            .scope = .cron,
+        });
+        return token_owned;
+    }
+
+    fn matchesToken(self: *const PairingGuard, token: []const u8, configured_only: bool, allow_cron_scope: bool) bool {
+        var hash_buf: [64]u8 = undefined;
+        const hashed = hashToken(token, &hash_buf);
+        const now = std_compat.time.timestamp();
+        // Scan every stored hash so authentication does not leak match position.
+        var found: u8 = 0;
+        var it = self.paired_tokens.iterator();
+        while (it.next()) |entry| {
+            if (!isTokenRecordActive(entry.value_ptr.*, now)) continue;
+            const token_matches = constantTimeEq(hashed, entry.key_ptr.*);
+            const source_matches = !configured_only or entry.value_ptr.configured;
+            const scope_matches = entry.value_ptr.scope == .all or allow_cron_scope;
+            found |= @as(u8, @intFromBool(token_matches and source_matches and scope_matches));
+        }
+        return found != 0;
+    }
+
+    /// Revoke a bearer token if it exists.
+    pub fn revokeToken(self: *PairingGuard, token: []const u8) bool {
+        if (!self.require_pairing_flag) return false;
+
+        var hash_buf: [64]u8 = undefined;
+        const hashed = hashToken(token, &hash_buf);
+        var it = self.paired_tokens.iterator();
+        while (it.next()) |entry| {
+            if (!constantTimeEq(hashed, entry.key_ptr.*)) continue;
+            if (self.paired_tokens.fetchRemove(entry.key_ptr.*)) |removed| {
+                self.allocator.free(@constCast(removed.key));
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /// Returns true if the gateway is already paired (has at least one token).
+    pub fn isPaired(self: *const PairingGuard) bool {
+        return self.hasPairedTokens();
+    }
+
+    /// Get count of paired tokens
+    pub fn tokenCount(self: *const PairingGuard) usize {
+        var count: usize = 0;
+        const now = std_compat.time.timestamp();
+        var it = self.paired_tokens.valueIterator();
+        while (it.next()) |record| {
+            if (record.scope == .all and isTokenRecordActive(record.*, now)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn tokenTtlSecs(self: *const PairingGuard) u32 {
+        return self.token_ttl_secs;
+    }
+
+    pub fn tokenExpiresInSecs(self: *const PairingGuard) u32 {
+        return self.token_ttl_secs;
+    }
+};
+
+/// Generate a 6-digit numeric pairing code using cryptographic randomness.
+fn generateCode() [6]u8 {
+    var bytes: [4]u8 = undefined;
+    std_compat.crypto.random.bytes(&bytes);
+    const raw = std.mem.readInt(u32, &bytes, .little);
+    // Rejection sampling to avoid modulo bias
+    const upper_bound: u32 = 1_000_000;
+    const reject_threshold: u32 = (std.math.maxInt(u32) / upper_bound) * upper_bound;
+    const val = if (raw < reject_threshold) raw % upper_bound else blk: {
+        // Extremely rare case; just re-draw
+        var retry_bytes: [4]u8 = undefined;
+        std_compat.crypto.random.bytes(&retry_bytes);
+        break :blk std.mem.readInt(u32, &retry_bytes, .little) % upper_bound;
+    };
+    var buf: [6]u8 = undefined;
+    _ = std.fmt.bufPrint(&buf, "{d:0>6}", .{val}) catch unreachable;
+    return buf;
+}
+
+/// Generate a bearer token with 256-bit entropy.
+fn generateToken() [67]u8 {
+    var random_bytes: [32]u8 = undefined;
+    std_compat.crypto.random.bytes(&random_bytes);
+    var buf: [67]u8 = undefined; // "zc_" (3) + 64 hex chars
+    @memcpy(buf[0..3], "zc_");
+    const hex = std.fmt.bytesToHex(random_bytes, .lower);
+    @memcpy(buf[3..67], &hex);
+    return buf;
+}
+
+/// SHA-256 hash a bearer token. Returns lowercase hex in the provided buffer.
+fn hashToken(token: []const u8, buf: *[64]u8) []const u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(token, &hash, .{});
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    @memcpy(buf, &hex);
+    return buf;
+}
+
+/// SHA-256 hash a token, returning an allocated hex string
+pub fn hashTokenAlloc(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(token, &hash, .{});
+    const result = try allocator.alloc(u8, 64);
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    @memcpy(result, &hex);
+    return result;
+}
+
+fn tokenExpiresAt(token_ttl_secs: u32) ?i64 {
+    if (token_ttl_secs == 0) return null;
+    return std_compat.time.timestamp() + @as(i64, @intCast(token_ttl_secs));
+}
+
+fn isTokenRecordActive(record: PairingGuard.TokenRecord, now: i64) bool {
+    const expires_at = record.expires_at orelse return true;
+    return expires_at > now;
+}
+
+/// Check if a stored value looks like a SHA-256 hash (64 hex chars)
+pub fn isTokenHash(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
+}
+
+/// Constant-time string comparison to prevent timing attacks.
+pub fn constantTimeEq(a: []const u8, b: []const u8) bool {
+    const len_diff = a.len ^ b.len;
+    const max_len = @max(a.len, b.len);
+    var byte_diff: u8 = 0;
+    for (0..max_len) |i| {
+        const x = if (i < a.len) a[i] else 0;
+        const y = if (i < b.len) b[i] else 0;
+        byte_diff |= x ^ y;
+    }
+    return (len_diff == 0) and (byte_diff == 0);
+}
+
+/// Check if a host string represents a non-localhost bind address.
+pub fn isPublicBind(host: []const u8) bool {
+    return !isLoopbackBindHost(host);
+}
+
+fn isLoopbackBindHost(host: []const u8) bool {
+    const normalized = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
+        host[1 .. host.len - 1]
+    else
+        host;
+
+    if (std.ascii.eqlIgnoreCase(normalized, "localhost")) return true;
+
+    if (std_compat.net.Address.parseIp4(normalized, 0)) |ip4| {
+        const octets: *const [4]u8 = @ptrCast(&ip4.in.sa.addr);
+        return octets[0] == 127;
+    } else |_| {}
+
+    if (std_compat.net.Address.parseIp6(normalized, 0)) |ip6| {
+        const bytes = ip6.in6.sa.addr;
+        return std.mem.eql(u8, bytes[0..15], &@as([15]u8, @splat(0))) and bytes[15] == 1;
+    } else |_| {}
+
+    return false;
+}
+
+fn isTruthyFlag(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on");
+}
+
+pub fn isYoloForceEnabled(allocator: std.mem.Allocator) bool {
+    if (platform.getEnvOrNull(allocator, "NULLCLAW_ALLOW_YOLO")) |v| {
+        defer allocator.free(v);
+        if (isTruthyFlag(v)) return true;
+    }
+    if (platform.getEnvOrNull(allocator, "OPENCLAW_ALLOW_YOLO")) |v| {
+        defer allocator.free(v);
+        if (isTruthyFlag(v)) return true;
+    }
+    return false;
+}
+
+pub fn isYoloGatewayAllowed(level: policy.AutonomyLevel, host: []const u8, forced: bool) bool {
+    if (level != .yolo) return true;
+    if (forced) return true;
+    return !isPublicBind(host);
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+test "new guard generates code when no tokens" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expect(guard.pairingCode() != null);
+    try std.testing.expect(!guard.isPaired());
+}
+
+test "new guard no code when tokens exist" {
+    const tokens = [_][]const u8{"zc_existing"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(guard.pairingCode() == null);
+    try std.testing.expect(guard.isPaired());
+}
+
+test "new guard no code when pairing disabled" {
+    var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard.deinit();
+    try std.testing.expect(guard.pairingCode() == null);
+}
+
+test "is authenticated when pairing disabled" {
+    var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard.deinit();
+    try std.testing.expect(guard.isAuthenticated("anything"));
+    try std.testing.expect(guard.isAuthenticated(""));
+}
+
+test "is authenticated with valid token" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(guard.isAuthenticated("zc_valid"));
+}
+
+test "is authenticated with prehashed token" {
+    var hash_buf: [64]u8 = undefined;
+    const hashed = hashToken("zc_valid", &hash_buf);
+    var hashed_copy: [64]u8 = undefined;
+    @memcpy(&hashed_copy, hashed);
+    const tokens = [_][]const u8{&hashed_copy};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(guard.isAuthenticated("zc_valid"));
+}
+
+test "is authenticated with invalid token" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(!guard.isAuthenticated("zc_invalid"));
+}
+
+test "revoke token removes matching bearer token" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(guard.isAuthenticated("zc_valid"));
+    try std.testing.expect(guard.revokeToken("zc_valid"));
+    try std.testing.expect(!guard.isAuthenticated("zc_valid"));
+    try std.testing.expect(guard.pairingCode() != null);
+}
+
+test "revoke token returns false for missing token" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(!guard.revokeToken("zc_missing"));
+    try std.testing.expect(guard.isAuthenticated("zc_valid"));
+}
+
+test "runtime-issued token expires when ttl elapses" {
+    var guard = try PairingGuard.initWithTokenTtl(std.testing.allocator, true, &.{}, 1);
+    defer guard.deinit();
+
+    const code = guard.pairingCode() orelse return error.TestUnexpectedResult;
+    const result = guard.attemptPair(code);
+    const token = switch (result) {
+        .paired => |paired_token| paired_token,
+        else => return error.TestUnexpectedResult,
+    };
+    defer std.testing.allocator.free(token);
+
+    try std.testing.expect(guard.isAuthenticated(token));
+    std_compat.thread.sleep(1100 * std.time.ns_per_ms);
+    try std.testing.expect(!guard.isAuthenticated(token));
+    try std.testing.expect(!guard.hasPairedTokens());
+
+    // Regression: expired runtime tokens must not strand the gateway in a
+    // permanent already_paired state with no usable pairing code.
+    const next_code = guard.pairingCode() orelse return error.TestUnexpectedResult;
+    const next_result = guard.attemptPair(next_code);
+    switch (next_result) {
+        .paired => |next_token| std.testing.allocator.free(next_token),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "preconfigured tokens remain active without runtime ttl metadata" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.initWithTokenTtl(std.testing.allocator, true, &tokens, 1);
+    defer guard.deinit();
+
+    std_compat.thread.sleep(1100 * std.time.ns_per_ms);
+    try std.testing.expect(guard.isAuthenticated("zc_valid"));
+    try std.testing.expect(guard.hasPairedTokens());
+}
+
+test "matchesConfiguredToken ignores runtime-issued tokens" {
+    const tokens = [_][]const u8{"zc_configured"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(guard.matchesStoredToken("zc_configured"));
+    try std.testing.expect(guard.matchesConfiguredToken("zc_configured"));
+
+    _ = try guard.setPairingCode("123456");
+    const result = guard.attemptPair("123456");
+    const runtime_token = switch (result) {
+        .paired => |token| token,
+        else => return error.TestUnexpectedResult,
+    };
+    defer std.testing.allocator.free(runtime_token);
+
+    // Regression: configured worker auth must not treat interactive /pair
+    // bearer tokens as configured paired_tokens.
+    try std.testing.expect(guard.matchesStoredToken(runtime_token));
+    try std.testing.expect(!guard.matchesConfiguredToken(runtime_token));
+}
+
+test "tokens stored as hashes" {
+    const tokens = [_][]const u8{ "zc_a", "zc_b" };
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expectEqual(@as(usize, 2), guard.tokenCount());
+}
+
+test "constant time eq same" {
+    try std.testing.expect(constantTimeEq("abc", "abc"));
+    try std.testing.expect(constantTimeEq("", ""));
+}
+
+test "constant time eq different" {
+    try std.testing.expect(!constantTimeEq("abc", "abd"));
+    try std.testing.expect(!constantTimeEq("abc", "ab"));
+    try std.testing.expect(!constantTimeEq("a", ""));
+}
+
+test "generate code is 6 digits" {
+    const code = generateCode();
+    try std.testing.expectEqual(@as(usize, 6), code.len);
+    for (&code) |c| {
+        try std.testing.expect(std.ascii.isDigit(c));
+    }
+}
+
+test "generate code is not deterministic" {
+    // Two codes should differ with overwhelming probability
+    var found_different = false;
+    for (0..10) |_| {
+        const c1 = generateCode();
+        const c2 = generateCode();
+        if (!std.mem.eql(u8, &c1, &c2)) {
+            found_different = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_different);
+}
+
+test "generate token has prefix" {
+    const token = generateToken();
+    try std.testing.expect(std.mem.startsWith(u8, &token, "zc_"));
+    try std.testing.expect(token.len > 10);
+}
+
+test "hash token produces 64 hex chars" {
+    var buf: [64]u8 = undefined;
+    const hash = hashToken("zc_test_token", &buf);
+    try std.testing.expectEqual(@as(usize, 64), hash.len);
+    for (hash) |c| {
+        try std.testing.expect(std.ascii.isHex(c));
+    }
+}
+
+test "hash token is deterministic" {
+    var buf1: [64]u8 = undefined;
+    var buf2: [64]u8 = undefined;
+    const h1 = hashToken("zc_abc", &buf1);
+    const h2 = hashToken("zc_abc", &buf2);
+    try std.testing.expectEqualStrings(h1, h2);
+}
+
+test "hash token differs for different inputs" {
+    var buf1: [64]u8 = undefined;
+    var buf2: [64]u8 = undefined;
+    const h1 = hashToken("zc_a", &buf1);
+    const h2 = hashToken("zc_b", &buf2);
+    try std.testing.expect(!std.mem.eql(u8, h1, h2));
+}
+
+test "is token hash detects hash vs plaintext" {
+    var buf: [64]u8 = undefined;
+    const hash = hashToken("zc_test", &buf);
+    var hash_arr: [64]u8 = undefined;
+    @memcpy(&hash_arr, hash);
+    try std.testing.expect(isTokenHash(&hash_arr));
+    try std.testing.expect(!isTokenHash("zc_test_token"));
+    try std.testing.expect(!isTokenHash("too_short"));
+    try std.testing.expect(!isTokenHash(""));
+}
+
+test "localhost variants not public" {
+    try std.testing.expect(!isPublicBind("127.0.0.1"));
+    try std.testing.expect(!isPublicBind("127.0.0.2"));
+    try std.testing.expect(!isPublicBind("127.255.255.255"));
+    try std.testing.expect(!isPublicBind("localhost"));
+    try std.testing.expect(!isPublicBind("LOCALHOST"));
+    try std.testing.expect(!isPublicBind("::1"));
+    try std.testing.expect(!isPublicBind("[::1]"));
+    try std.testing.expect(!isPublicBind("0:0:0:0:0:0:0:1"));
+    try std.testing.expect(!isPublicBind("[0:0:0:0:0:0:0:1]"));
+}
+
+test "zero zero is public" {
+    try std.testing.expect(isPublicBind("0.0.0.0"));
+}
+
+test "real ip is public" {
+    try std.testing.expect(isPublicBind("192.168.1.100"));
+    try std.testing.expect(isPublicBind("10.0.0.1"));
+}
+
+// ── Additional pairing tests ────────────────────────────────────
+
+test "brute force lockout after max attempts" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    // Exhaust all attempts with wrong code
+    for (0..5) |_| {
+        const result = try guard.tryPair("000000");
+        try std.testing.expect(result == null);
+    }
+
+    // Next attempt should return LockedOut error
+    const locked_result = guard.tryPair("000000");
+    try std.testing.expectError(error.LockedOut, locked_result);
+}
+
+test "failed attempts increment" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    // Wrong code should return null
+    const result = try guard.tryPair("wrong");
+    try std.testing.expect(result == null);
+
+    // failed_count should be 1
+    try std.testing.expectEqual(@as(u32, 1), guard.failed_count);
+}
+
+test "lockout time set after max attempts" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    try std.testing.expect(guard.lockout_time == null);
+
+    for (0..5) |_| {
+        _ = try guard.tryPair("wrong");
+    }
+
+    try std.testing.expect(guard.lockout_time != null);
+}
+
+test "multiple tokens can be added" {
+    const tokens = [_][]const u8{ "zc_a", "zc_b", "zc_c" };
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expectEqual(@as(usize, 3), guard.tokenCount());
+    try std.testing.expect(guard.isAuthenticated("zc_a"));
+    try std.testing.expect(guard.isAuthenticated("zc_b"));
+    try std.testing.expect(guard.isAuthenticated("zc_c"));
+    try std.testing.expect(!guard.isAuthenticated("zc_d"));
+}
+
+test "require pairing getter" {
+    var guard1 = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard1.deinit();
+    try std.testing.expect(guard1.requirePairing());
+
+    var guard2 = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard2.deinit();
+    try std.testing.expect(!guard2.requirePairing());
+}
+
+test "pairing code is 6 chars" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    const code = guard.pairingCode().?;
+    try std.testing.expectEqual(@as(usize, 6), code.len);
+}
+
+test "regenerate pairing code creates new code and resets lockout counters" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    const first = guard.pairingCode() orelse return error.TestUnexpectedResult;
+    var first_copy: [6]u8 = undefined;
+    @memcpy(&first_copy, first);
+
+    guard.failed_count = 5;
+    guard.lockout_time = std_compat.time.nanoTimestamp();
+
+    const second = guard.regeneratePairingCode() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(second.len == 6);
+    try std.testing.expect(!std.mem.eql(u8, &first_copy, second));
+    try std.testing.expectEqual(@as(u32, 0), guard.failed_count);
+    try std.testing.expect(guard.lockout_time == null);
+}
+
+test "revoke last runtime token re-enables pairing" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    const code = guard.pairingCode() orelse return error.TestUnexpectedResult;
+    const result = guard.attemptPair(code);
+    const token = switch (result) {
+        .paired => |paired_token| paired_token,
+        else => return error.TestUnexpectedResult,
+    };
+    defer std.testing.allocator.free(token);
+
+    try std.testing.expect(guard.revokeToken(token));
+    const next_code = guard.pairingCode() orelse return error.TestUnexpectedResult;
+    const next_result = guard.attemptPair(next_code);
+    switch (next_result) {
+        .paired => |next_token| std.testing.allocator.free(next_token),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "set pairing code enforces provided 6-digit value" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    guard.failed_count = 3;
+    guard.lockout_time = std_compat.time.nanoTimestamp();
+
+    const fixed = try guard.setPairingCode("123456");
+    try std.testing.expectEqualStrings("123456", fixed);
+    try std.testing.expectEqualStrings("123456", guard.pairingCode().?);
+    try std.testing.expectEqual(@as(u32, 0), guard.failed_count);
+    try std.testing.expect(guard.lockout_time == null);
+}
+
+test "set pairing code rejects invalid format" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expectError(error.InvalidPairingCode, guard.setPairingCode("abc"));
+    try std.testing.expectError(error.InvalidPairingCode, guard.setPairingCode("12a456"));
+}
+
+test "is public bind empty string" {
+    try std.testing.expect(isPublicBind(""));
+}
+
+test "isYoloGatewayAllowed rejects remote host without force" {
+    try std.testing.expect(!isYoloGatewayAllowed(.yolo, "0.0.0.0", false));
+}
+
+test "isYoloGatewayAllowed allows loopback variants without force" {
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "127.0.0.1", false));
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "127.0.0.2", false));
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "LOCALHOST", false));
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "0:0:0:0:0:0:0:1", false));
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "[0:0:0:0:0:0:0:1]", false));
+}
+
+test "isYoloGatewayAllowed allows force override" {
+    try std.testing.expect(isYoloGatewayAllowed(.yolo, "0.0.0.0", true));
+}
+
+test "isYoloGatewayAllowed allows non-yolo levels" {
+    try std.testing.expect(isYoloGatewayAllowed(.supervised, "0.0.0.0", false));
+}
+
+test "constant time eq handles unicode bytes" {
+    try std.testing.expect(constantTimeEq("\xc3\xa9", "\xc3\xa9"));
+    try std.testing.expect(!constantTimeEq("\xc3\xa9", "\xc3\xa8"));
+}
+
+test "constant time eq single char" {
+    try std.testing.expect(constantTimeEq("a", "a"));
+    try std.testing.expect(!constantTimeEq("a", "b"));
+}
+
+test "constant time eq long strings" {
+    const a = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const b = "abcdefghijklmnopqrstuvwxyz0123456789";
+    try std.testing.expect(constantTimeEq(a, b));
+}
+
+test "generate token length is 67" {
+    const token = generateToken();
+    try std.testing.expectEqual(@as(usize, 67), token.len);
+}
+
+test "generate token is not deterministic" {
+    var found_different = false;
+    for (0..10) |_| {
+        const t1 = generateToken();
+        const t2 = generateToken();
+        if (!std.mem.eql(u8, &t1, &t2)) {
+            found_different = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_different);
+}
+
+test "is public bind various addresses" {
+    // Private IP ranges that are still "public bind"
+    try std.testing.expect(isPublicBind("172.16.0.1"));
+    try std.testing.expect(isPublicBind("8.8.8.8"));
+    // Hostname
+    try std.testing.expect(isPublicBind("example.com"));
+}
+
+test "token count starts at zero" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expectEqual(@as(usize, 0), guard.tokenCount());
+}
+
+test "is paired returns false when no tokens" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expect(!guard.isPaired());
+}
+
+test "is paired returns true with tokens" {
+    const tokens = [_][]const u8{"zc_test"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(guard.isPaired());
+}
+
+// ── attemptPair tests ───────────────────────────────────────────
+
+test "attemptPair returns missing_code when header absent" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    const result = guard.attemptPair(null);
+    try std.testing.expect(result == .missing_code);
+}
+
+test "attemptPair succeeds with valid one-time code" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+
+    const code = guard.pairingCode().?;
+    const result = guard.attemptPair(code);
+    switch (result) {
+        .paired => |token| {
+            defer std.testing.allocator.free(token);
+            try std.testing.expect(std.mem.startsWith(u8, token, "zc_"));
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "cron token is scoped and does not consume interactive pairing" {
+    // Regression: issue #839 needs a cron-scoped scheduler credential without
+    // persisting or broadening an interactive full-gateway bearer token.
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    const pairing_code = try std.testing.allocator.dupe(u8, guard.pairingCode().?);
+    defer std.testing.allocator.free(pairing_code);
+
+    const cron_token = try guard.issueCronToken();
+    defer std.testing.allocator.free(cron_token);
+    try std.testing.expect(guard.isCronAuthenticated(cron_token));
+    try std.testing.expect(!guard.isAuthenticated(cron_token));
+    try std.testing.expect(!guard.matchesStoredToken(cron_token));
+    try std.testing.expectEqual(@as(usize, 0), guard.tokenCount());
+
+    const result = guard.attemptPair(pairing_code);
+    switch (result) {
+        .paired => |interactive_token| {
+            defer std.testing.allocator.free(interactive_token);
+            try std.testing.expect(guard.isAuthenticated(interactive_token));
+            try std.testing.expect(guard.isCronAuthenticated(interactive_token));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn issueCronTokenAllocationTest(allocator: std.mem.Allocator) !void {
+    var guard = try PairingGuard.init(allocator, true, &.{});
+    defer guard.deinit();
+    const token = try guard.issueCronToken();
+    defer allocator.free(token);
+}
+
+test "issueCronToken frees partial allocations on out-of-memory" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        issueCronTokenAllocationTest,
+        .{},
+    );
+}
+
+test "attemptPair reports already_paired when no code is available" {
+    const tokens = [_][]const u8{"zc_existing"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    const result = guard.attemptPair("123456");
+    try std.testing.expect(result == .already_paired);
+}
+
+test "attemptPair reports disabled when pairing is off" {
+    var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard.deinit();
+
+    const result = guard.attemptPair("123456");
+    try std.testing.expect(result == .disabled);
+}
+
+test "hasPairedTokens false when no tokens" {
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expect(!guard.hasPairedTokens());
+}
+
+test "hasPairedTokens true after token added" {
+    const tokens = [_][]const u8{"zc_test_token"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(guard.hasPairedTokens());
+}
+
+test "hasPairedTokens false when pairing disabled and no tokens" {
+    var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard.deinit();
+    try std.testing.expect(!guard.hasPairedTokens());
+}
+
+test "isAuthenticated rejects tampered, truncated, and substitute bearer tokens" {
+    // The token is SHA-256 hashed before constant-time comparison; any
+    // single-bit change produces an avalanche-different hash. Tampering
+    // only the last byte (as the original test did) would still pass if
+    // the comparator were buggy in a "prefix-match" direction. Tamper at
+    // first / middle / last positions to exercise the full hash boundary,
+    // and add several adversarial-shape negatives that would defeat naive
+    // comparators.
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    const code = guard.pairingCode().?;
+    const token = (try guard.tryPair(code)).?;
+    defer std.testing.allocator.free(token);
+
+    try std.testing.expect(guard.isAuthenticated(token));
+    try std.testing.expect(token.len > 4);
+
+    // Position-based tamper: first, middle, last byte.
+    const positions = [_]usize{ 0, token.len / 2, token.len - 1 };
+    for (positions) |pos| {
+        var tampered = try std.testing.allocator.dupe(u8, token);
+        defer std.testing.allocator.free(tampered);
+        tampered[pos] ^= 0xFF;
+        try std.testing.expect(!guard.isAuthenticated(tampered));
+    }
+
+    // Truncation: catches a buggy comparator that would prefix-match.
+    try std.testing.expect(!guard.isAuthenticated(token[0 .. token.len - 1]));
+
+    // Length-mismatch via suffix concatenation: catches a comparator that
+    // ignores trailing bytes.
+    var extended = try std.testing.allocator.alloc(u8, token.len + 1);
+    defer std.testing.allocator.free(extended);
+    @memcpy(extended[0..token.len], token);
+    extended[token.len] = 'x';
+    try std.testing.expect(!guard.isAuthenticated(extended));
+
+    // All-zero token of the same length: catches a default-value-accept bug.
+    const zeros = try std.testing.allocator.alloc(u8, token.len);
+    defer std.testing.allocator.free(zeros);
+    @memset(zeros, 0);
+    try std.testing.expect(!guard.isAuthenticated(zeros));
+
+    // Empty token: boundary case.
+    try std.testing.expect(!guard.isAuthenticated(""));
+}
