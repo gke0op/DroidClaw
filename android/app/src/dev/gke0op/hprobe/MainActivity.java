@@ -22,7 +22,9 @@ import java.util.List;
 
 public class MainActivity extends Activity {
     private TextView out;
-    private android.widget.EditText keyField;
+    private android.widget.EditText keyField, peerField;
+    private static java.net.ServerSocket listener;
+    static final int PEER_PORT = 47800;
     private SharedPreferences p;
 
     @Override protected void onCreate(Bundle b) {
@@ -31,7 +33,7 @@ public class MainActivity extends Activity {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         TextView title = new TextView(this);
-        title.setText("nullhermes probe v0.6");
+        title.setText("nullhermes probe v0.7");
         title.setTextSize(22);
         col.addView(title);
 
@@ -57,6 +59,11 @@ public class MainActivity extends Activity {
         col.addView(keyField);
         add(col, "5 · Agent turn on this phone (nullclaw → OpenRouter)", v -> agentTurn());
         add(col, "6 · Network reachability (NAT type + public IPv6)", v -> reachability());
+        add(col, "7 · Listen for a peer (TCP port 47800, IPv6+IPv4)", v -> listen());
+        peerField = new android.widget.EditText(this);
+        peerField.setHint("peer address for step 8 (e.g. 2a02:...:44d2)");
+        col.addView(peerField);
+        add(col, "8 · Connect to peer (hello + round-trip time)", v -> connectPeer());
         add(col, "Export log to Downloads", v -> export());
         add(col, "Refresh", v -> refresh());
         add(col, "Stop heartbeat", v -> stop());
@@ -233,6 +240,54 @@ public class MainActivity extends Activity {
             } catch (Exception e) { sb.append(" addr_fail=").append(e); }
             Log.line(this, sb.toString());
             try { Log.line(this, Native.nat()); } catch (Throwable e) { Log.line(this, "NAT_FAIL " + e); }
+            runOnUiThread(this::refresh);
+        }).start();
+    }
+
+    /** Accepts peers on [::]:47800 (dual-stack); answers each hello with a timestamped echo. */
+    private void listen() {
+        if (listener != null) { toast("Already listening on " + PEER_PORT); return; }
+        new Thread(() -> {
+            try {
+                listener = new java.net.ServerSocket(PEER_PORT);
+                Log.line(this, "LISTEN ok port=" + PEER_PORT);
+                runOnUiThread(() -> { toast("Listening on port " + PEER_PORT); refresh(); });
+                while (true) {
+                    try (java.net.Socket s = listener.accept()) {
+                        s.setSoTimeout(10_000);
+                        java.io.BufferedReader in = new java.io.BufferedReader(new java.io.InputStreamReader(s.getInputStream()));
+                        String hello = in.readLine();
+                        s.getOutputStream().write(("echo " + hello + "\n").getBytes());
+                        Log.line(this, "INBOUND from=" + s.getInetAddress().getHostAddress() + " msg=" + hello);
+                    } catch (Exception e) { Log.line(this, "INBOUND_FAIL " + e); }
+                    runOnUiThread(this::refresh);
+                }
+            } catch (Exception e) {
+                listener = null;
+                Log.line(this, "LISTEN_FAIL " + e);
+                runOnUiThread(this::refresh);
+            }
+        }).start();
+    }
+
+    /** Dials the peer's listener and measures connect + echo round trip. */
+    private void connectPeer() {
+        String host = peerField.getText().toString().trim();
+        if (host.isEmpty()) { toast("Enter the other phone's address"); return; }
+        toast("Connecting…");
+        new Thread(() -> {
+            long t0 = System.nanoTime();
+            try (java.net.Socket s = new java.net.Socket()) {
+                s.connect(new java.net.InetSocketAddress(java.net.InetAddress.getByName(host), PEER_PORT), 10_000);
+                long tc = System.nanoTime();
+                s.setSoTimeout(10_000);
+                s.getOutputStream().write(("hello from " + Build.MODEL + "\n").getBytes());
+                String reply = new java.io.BufferedReader(new java.io.InputStreamReader(s.getInputStream())).readLine();
+                Log.line(this, "PEER_OK to=" + host + " connect_ms=" + (tc - t0) / 1_000_000
+                        + " rtt_ms=" + (System.nanoTime() - tc) / 1_000_000 + " reply=" + reply);
+            } catch (Exception e) {
+                Log.line(this, "PEER_FAIL to=" + host + " after_ms=" + (System.nanoTime() - t0) / 1_000_000 + " " + e);
+            }
             runOnUiThread(this::refresh);
         }).start();
     }
