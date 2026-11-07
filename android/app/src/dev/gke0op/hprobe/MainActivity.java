@@ -31,7 +31,7 @@ public class MainActivity extends Activity {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         TextView title = new TextView(this);
-        title.setText("nullhermes probe v0.5");
+        title.setText("nullhermes probe v0.6");
         title.setTextSize(22);
         col.addView(title);
 
@@ -56,6 +56,7 @@ public class MainActivity extends Activity {
         keyField.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
         col.addView(keyField);
         add(col, "5 · Agent turn on this phone (nullclaw → OpenRouter)", v -> agentTurn());
+        add(col, "6 · Network reachability (NAT type + public IPv6)", v -> reachability());
         add(col, "Export log to Downloads", v -> export());
         add(col, "Refresh", v -> refresh());
         add(col, "Stop heartbeat", v -> stop());
@@ -198,6 +199,40 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 Log.line(this, "AGENT EXEC_FAIL " + e);
             }
+            runOnUiThread(this::refresh);
+        }).start();
+    }
+
+    /** Can this phone be reached without anyone's server? Logs transport, addresses, NAT behaviour. */
+    private void reachability() {
+        toast("Probing network…");
+        new Thread(() -> {
+            StringBuilder sb = new StringBuilder("NET");
+            try {
+                android.net.ConnectivityManager cm = getSystemService(android.net.ConnectivityManager.class);
+                android.net.NetworkCapabilities nc = cm.getNetworkCapabilities(cm.getActiveNetwork());
+                String t = nc == null ? "none" : nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) ? "wifi"
+                        : nc.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) ? "cellular" : "other";
+                sb.append(" transport=").append(t);
+                int pub6 = 0;
+                for (java.net.NetworkInterface ni : java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())) {
+                    if (!ni.isUp() || ni.isLoopback()) continue;
+                    for (java.net.InetAddress a : java.util.Collections.list(ni.getInetAddresses())) {
+                        String kind;
+                        if (a instanceof java.net.Inet6Address) {
+                            byte b0 = a.getAddress()[0];
+                            boolean ula = (b0 & 0xfe) == 0xfc;
+                            kind = a.isLinkLocalAddress() ? "v6-link" : ula ? "v6-ula" : "v6-PUBLIC";
+                            if (kind.equals("v6-PUBLIC")) pub6++;
+                        } else kind = a.isSiteLocalAddress() ? "v4-private" : "v4-public";
+                        String h = a.getHostAddress(); int pct = h.indexOf('%'); if (pct > 0) h = h.substring(0, pct);
+                        sb.append(" ").append(ni.getName()).append(":").append(kind).append("=").append(h);
+                    }
+                }
+                sb.append(" public_v6_count=").append(pub6);
+            } catch (Exception e) { sb.append(" addr_fail=").append(e); }
+            Log.line(this, sb.toString());
+            try { Log.line(this, Native.nat()); } catch (Throwable e) { Log.line(this, "NAT_FAIL " + e); }
             runOnUiThread(this::refresh);
         }).start();
     }
